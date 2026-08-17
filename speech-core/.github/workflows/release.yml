@@ -1,0 +1,426 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing v* tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+
+jobs:
+  # Linux CLI packages — .deb + .tar.gz per arch, attached to the release.
+  # Built on ubuntu-22.04 (oldest supported glibc 2.35) so the binaries run
+  # on 22.04, 24.04 and newer. amd64 is the full package (ONNX CLI tools +
+  # LiteRT voice-cloning CLI); arm64 is cross-compiled and ONNX-only, since
+  # fetch_litert.sh resolves the host-platform wheel and the cross sysroot
+  # has no ALSA (mirrors ci.yml's linux-examples-aarch64 lane).
+  build-linux-packages:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+          - arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Verify release tag checkout
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+
+      - name: Install build deps (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libasound2-dev curl ca-certificates \
+              python3-pip unzip file
+
+      - name: Install cross toolchain (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              g++-aarch64-linux-gnu gcc-aarch64-linux-gnu cmake curl \
+              ca-certificates file
+
+      - name: Download ONNX Runtime
+        run: |
+          ./examples/linux/setup_linux.sh ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
+          ls -la ort-linux/lib/
+
+      - name: Fetch LiteRT runtime (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          ./scripts/fetch_litert.sh litert-linux
+          ls -la litert-linux/
+
+      - name: Configure (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          cmake -B build-pkg \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DSPEECH_CORE_WITH_ONNX=ON \
+              -DSPEECH_CORE_WITH_LITERT=ON \
+              -DLITERT_DIR=litert-linux \
+              -DSPEECH_CORE_BUILD_EXAMPLES=ON \
+              -DSPEECH_CORE_BUILD_HTTP_SERVER=ON \
+              -DSPEECH_CORE_BUILD_TESTS=OFF \
+              -DSPEECH_LINUX_BUILD_TESTS=OFF \
+              -DSPEECH_CORE_PACKAGE=ON \
+              "-DSPEECH_CORE_PACKAGE_VERSION=${RELEASE_TAG#v}" \
+              -DORT_DIR=ort-linux
+
+      - name: Configure (arm64 cross)
+        if: matrix.arch == 'arm64'
+        run: |
+          cmake -B build-pkg \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+              -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+              -DCMAKE_SYSTEM_NAME=Linux \
+              -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+              -DSPEECH_CORE_WITH_ONNX=ON \
+              -DSPEECH_CORE_BUILD_EXAMPLES=ON \
+              -DSPEECH_CORE_BUILD_HTTP_SERVER=ON \
+              -DSPEECH_CORE_BUILD_TESTS=OFF \
+              -DSPEECH_LINUX_BUILD_DEMO=OFF \
+              -DSPEECH_LINUX_BUILD_TESTS=OFF \
+              -DSPEECH_CORE_PACKAGE=ON \
+              "-DSPEECH_CORE_PACKAGE_VERSION=${RELEASE_TAG#v}" \
+              -DORT_DIR=ort-linux
+
+      - name: Build
+        run: cmake --build build-pkg --parallel
+
+      - name: Package
+        run: |
+          cd build-pkg
+          cpack -B ../dist
+          ls -la ../dist
+
+      - name: Smoke-test .deb in clean containers (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          for img in ubuntu:22.04 ubuntu:24.04; do
+            echo "=== $img ==="
+            docker run --rm -v "$PWD/dist:/dist:ro" "$img" bash -ec '
+              apt-get update -q
+              apt-get install -yq /dist/speech_*_amd64.deb
+              for exe in speech_transcribe speech_synthesize speech_phonemize \
+                         speech_voxcpm2_clone speech_demo speech-server; do
+                echo "--- ldd $exe"
+                test -x "/usr/bin/$exe" || { echo "MISSING $exe"; exit 1; }
+                if ldd /usr/bin/$exe | grep "not found"; then
+                  echo "UNRESOLVED LIBS in $exe"; exit 1
+                fi
+              done
+              for sh in speech_download_models speech_download_models_litert \
+                        speech_download_voxcpm2 speech; do
+                test -x "/usr/bin/$sh" || { echo "MISSING $sh"; exit 1; }
+              done
+              # Multiplexer dispatch must reach the real binaries.
+              /usr/bin/speech --help | grep -q transcribe
+              /usr/bin/speech-server --help | grep -q /v1/audio/speech
+              /usr/bin/speech-server --help | grep -q /v1/audio/transcriptions
+              /usr/bin/speech serve --help | grep -q /v1/audio/speech
+              /usr/bin/speech serve --help | grep -q /v1/audio/transcriptions
+              out=$(/usr/bin/speech phonemize 2>&1 | head -2 || true)
+              [ -n "$out" ] || { echo "speech phonemize dispatch failed"; exit 1; }
+              out=$(/usr/bin/speech download-models voxcpm2 /proc/not-writable 2>&1 | head -2 || true)
+              echo "$out" | grep -q "mkdir\|fetch\|not available\|Read-only" || {
+                echo "speech voxcpm2 downloader dispatch failed"; exit 1;
+              }
+              # Usage exits are non-zero by design; assert the binaries load
+              # far enough to print *something* (a crash prints nothing).
+              out=$(/usr/bin/speech_phonemize 2>&1 | head -2 || true)
+              [ -n "$out" ] || { echo "speech_phonemize produced no output"; exit 1; }
+              out=$(/usr/bin/speech_voxcpm2_clone 2>&1 | head -2 || true)
+              [ -n "$out" ] || { echo "speech_voxcpm2_clone produced no output"; exit 1; }
+              echo SMOKE-OK
+            '
+          done
+
+      - name: Verify arm64 artefacts (cross — no execution possible)
+        if: matrix.arch == 'arm64'
+        run: |
+          # INSTALL_RPATH is applied while CPack installs into the package, so
+          # inspect the extracted .deb rather than the build-tree executables.
+          # The package can't be executed on the x86_64 release runner.
+          mkdir package-root
+          dpkg-deb -x dist/speech_*_arm64.deb package-root
+          for exe in package-root/usr/bin/speech_transcribe \
+                     package-root/usr/bin/speech_synthesize \
+                     package-root/usr/bin/speech_phonemize \
+                     package-root/usr/bin/speech-server; do
+            file "$exe" | tee /dev/stderr | grep -q "aarch64"
+            # shellcheck disable=SC2016 # Match the literal ELF $ORIGIN token.
+            readelf -d "$exe" | tee /dev/stderr | grep -E "RUNPATH|RPATH" | grep -q '\$ORIGIN/../lib'
+          done
+          dpkg -c dist/speech_*_arm64.deb | grep -E "bin/|lib/" | head -30
+
+      - name: Stage Linux release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-contained Windows x64 ZIP — ONNX CLI tools, the OpenAI-compatible
+  # speech-server sidecar, speech.dll, ONNX Runtime, and a native PowerShell
+  # model downloader. Models remain first-run downloads rather than release
+  # assets so the application archive stays small.
+  build-windows-package:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Verify release tag checkout
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Download ONNX Runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_VERSION=1.19.0
+          curl -fL --retry 3 \
+            -o ort.zip \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-win-x64-${ORT_VERSION}.zip"
+          echo "1d796da7001e4843858d0587aa8232976abf9e0ae7fba8deb7fa8156e440efb7  ort.zip" \
+            | sha256sum -c -
+          unzip -q ort.zip
+          mkdir -p ort-windows/include ort-windows/lib
+          cp onnxruntime-win-x64-${ORT_VERSION}/include/*.h ort-windows/include/
+          cp onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime.dll \
+             onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime_providers_shared.dll \
+             onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime.lib \
+             ort-windows/lib/
+          cp onnxruntime-win-x64-${ORT_VERSION}/LICENSE \
+             onnxruntime-win-x64-${ORT_VERSION}/ThirdPartyNotices.txt \
+             ort-windows/
+          test -f ort-windows/lib/onnxruntime.dll
+          test -f ort-windows/lib/onnxruntime_providers_shared.dll
+          test -f ort-windows/lib/onnxruntime.lib
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build-pkg -A x64 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DSPEECH_CORE_WITH_ONNX=ON \
+              -DSPEECH_CORE_BUILD_EXAMPLES=ON \
+              -DSPEECH_CORE_BUILD_HTTP_SERVER=ON \
+              -DSPEECH_CORE_BUILD_TESTS=OFF \
+              -DSPEECH_LINUX_BUILD_DEMO=OFF \
+              -DSPEECH_LINUX_BUILD_TESTS=OFF \
+              -DSPEECH_CORE_PACKAGE=ON \
+              "-DSPEECH_CORE_PACKAGE_VERSION=${RELEASE_TAG#v}" \
+              -DORT_DIR="$PWD/ort-windows"
+
+      - name: Build
+        shell: bash
+        run: cmake --build build-pkg --parallel --config Release
+
+      - name: Package
+        shell: bash
+        run: |
+          cpack --config build-pkg/CPackConfig.cmake -C Release -B dist
+          ls -la dist
+
+      - name: Verify Windows archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $archive = Get-ChildItem dist -Filter "speech-*-windows-x64.zip" |
+            Select-Object -First 1
+          if (-not $archive) { throw "Windows release ZIP was not produced" }
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath unpacked
+          $root = Get-ChildItem unpacked -Directory | Select-Object -First 1
+          if (-not $root) { throw "Windows release ZIP has no top-level directory" }
+          $required = @(
+            "bin/speech-server.exe",
+            "bin/speech_transcribe.exe",
+            "bin/speech_synthesize.exe",
+            "bin/speech_phonemize.exe",
+            "bin/speech.dll",
+            "bin/onnxruntime.dll",
+            "bin/onnxruntime_providers_shared.dll",
+            "bin/msvcp140.dll",
+            "bin/vcruntime140.dll",
+            "bin/vcruntime140_1.dll",
+            "bin/speech_download_models.ps1",
+            "include/speech.h",
+            "lib/speech.lib",
+            "LICENSE",
+            "THIRD-PARTY-NOTICES.md",
+            "ONNXRUNTIME-LICENSE",
+            "ONNXRUNTIME-THIRD-PARTY-NOTICES.txt"
+          )
+          foreach ($relative in $required) {
+            $path = Join-Path $root.FullName $relative
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Missing packaged file: $relative"
+            }
+          }
+          $server = Join-Path $root.FullName "bin/speech-server.exe"
+          $help = & $server --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0 -or
+              $help -notmatch "/v1/audio/speech" -or
+              $help -notmatch "/v1/audio/transcriptions") {
+            throw "speech-server.exe did not start and print endpoint help"
+          }
+          foreach ($executable in @("speech_transcribe.exe", "speech_synthesize.exe", "speech_phonemize.exe")) {
+            $executablePath = Join-Path $root.FullName "bin/$executable"
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $executablePath
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $startInfo.CreateNoWindow = $true
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            try {
+              if (-not $process.Start()) {
+                throw "$executable did not start"
+              }
+              $stdout = $process.StandardOutput.ReadToEndAsync()
+              $stderr = $process.StandardError.ReadToEndAsync()
+              $process.WaitForExit()
+              $output = [string]::Concat(
+                $stdout.GetAwaiter().GetResult(),
+                $stderr.GetAwaiter().GetResult()
+              )
+              if ($process.ExitCode -ne 2 -or [string]::IsNullOrWhiteSpace($output)) {
+                throw "$executable did not reach its expected usage boundary"
+              }
+            } finally {
+              $process.Dispose()
+            }
+          }
+
+      - name: Stage Windows release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  build-xcframework:
+    runs-on: macos-latest
+    outputs:
+      checksum: ${{ steps.checksum.outputs.checksum }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Verify release tag checkout
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+
+      - name: Build XCFramework
+        run: ./scripts/build_xcframework.sh
+
+      - name: Compute checksum
+        id: checksum
+        run: |
+          cd dist
+          CHECKSUM=$(swift package compute-checksum SpeechCore.xcframework.zip)
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
+          echo "Checksum: $CHECKSUM"
+
+      - name: Stage XCFramework release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-xcframework
+          path: dist/SpeechCore.xcframework.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish complete release
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux-packages
+      - build-windows-package
+      - build-xcframework
+
+    steps:
+      - name: Download validated release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify complete asset set
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -name 'speech_*.deb' | wc -l)" -eq 2
+          test "$(find dist -maxdepth 1 -name 'speech-*-linux-*.tar.gz' | wc -l)" -eq 2
+          test "$(find dist -maxdepth 1 -name 'speech-*-windows-x64.zip' | wc -l)" -eq 1
+          test -f dist/SpeechCore.xcframework.zip
+          ls -lh dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/speech-*-windows-x64.zip
+            dist/SpeechCore.xcframework.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## Desktop packages
+
+            - Linux amd64/arm64: `.deb` and `.tar.gz` CLI/server packages
+            - Windows x64: self-contained `.zip` with ONNX Runtime and PowerShell model downloader
+            - OpenAI-compatible local audio: `POST /v1/audio/speech` and `POST /v1/audio/transcriptions`
+
+            ## SpeechCore XCFramework
+
+            **Checksum:** `${{ needs.build-xcframework.outputs.checksum }}`
+
+            ### Usage in Package.swift
+            ```swift
+            .binaryTarget(
+                name: "CSpeechCore",
+                url: "https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/SpeechCore.xcframework.zip",
+                checksum: "${{ needs.build-xcframework.outputs.checksum }}"
+            )
+            ```

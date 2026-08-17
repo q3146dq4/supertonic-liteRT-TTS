@@ -1,0 +1,3 @@
+The previous build script failed on Windows because batch parsing broke on the space in
+"C:\Program Files\Android\Android Studio\jbr". This version avoids the problematic nested
+FOR/F parsing and uses a project-local Temurin JDK 17 when no JAVA17_HOME is supplied.

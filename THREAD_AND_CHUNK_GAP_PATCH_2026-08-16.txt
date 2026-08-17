@@ -1,0 +1,12 @@
+THREAD / CHUNK GAP PATCH
+
+- Restored CPU thread selector: 2 / 4 / 8 threads.
+- Thread count is persisted and applied to all four Supertonic graphs through the stable TFLite/XNNPACK interpreter ABI.
+- System TTS reads the same stored thread setting and recreates the synthesizer when it changes.
+- Profile now reports `threads=`.
+- Chunk boundary audio now receives conservative edge-silence trimming (only long edge silence is removed), followed by a 5 ms crossfade. This targets the long inter-chunk pauses without trimming short phoneme onsets.
+- Explicit added chunk silence remains 0 ms.
+
+Build validation:
+- `litert_supertonic_tts.cpp` passes clang++ C++17 syntax-only validation against the vendored LiteRT headers.
+- Full Android APK build was not run because the environment cannot fetch missing Gradle distribution artifacts.

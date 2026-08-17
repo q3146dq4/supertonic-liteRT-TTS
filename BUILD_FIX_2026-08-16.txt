@@ -1,0 +1,16 @@
+Build fix for :app:assembleDebug
+
+Fixed speech-core/src/models/litert/litert_supertonic_tts.cpp:
+- added local utf8_to_u32()
+- added local u32_to_utf8()
+- added local active_range() used only for silence profiling
+- added <utility> for std::pair
+
+These functions were referenced by litert_supertonic_tts.cpp but were private
+to the anonymous namespace of supertonic_tokenizer.cpp (or missing entirely),
+which caused the three compiler errors:
+  use of undeclared identifier 'utf8_to_u32'
+  use of undeclared identifier 'u32_to_utf8'
+  use of undeclared identifier 'active_range'
+
+No waveform trimming behavior was added; active_range() is diagnostic only.

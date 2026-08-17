@@ -1,0 +1,6 @@
+2026-08-16 build/UI fix
+
+- Fixed MainActivity.kt compile error in formatProfile(): the Backend line contained an accidental literal newline inside a Kotlin string, causing Syntax error: Expecting '"' at compile time.
+- Custom Voice 가져오기 / Custom Voice 삭제 now use equal 1:1 horizontal weights with a small gap and single-line labels, so both buttons have the same width/height and 삭제 no longer wraps as '삭' / '제'.
+- Main-screen 정규식 설정 / 가져오기 / 내보내기 now use equal 1:1:1 widths with consistent spacing and single-line labels.
+- Pronunciation Rules screen's 기본값 / 내보내기 action buttons were also normalized to equal widths.

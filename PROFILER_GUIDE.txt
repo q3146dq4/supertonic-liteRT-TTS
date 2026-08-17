@@ -1,0 +1,34 @@
+Supertonic v3 LiteRT TTS — 설정/음성 검증 가이드
+
+앱 자체 테스트
+1. Voice를 F1에서 F2 또는 M5로 변경
+2. Speed를 0.50 / 1.00 / 1.50로 바꿔 각각 생성
+3. Steps를 4 / 8로 바꿔 생성
+4. Performance Profile에서 Applied voice / Applied speed / Applied steps / VE Step N을 확인
+
+예상:
+- Voice가 F2라면 Applied voice = F2
+- Speed가 1.50이라면 Applied speed = 1.50
+- Steps가 4라면 VE Step이 4개
+- Steps가 8이라면 VE Step이 8개
+
+시스템 TTS 테스트
+1. Android 설정 → 텍스트 음성 변환 → Supertonic v3 LiteRT TTS 선택
+2. 다른 앱에서 같은 문장을 합성
+3. 다른 Voice를 Android TTS Voice로 선택했거나 앱 설정을 변경한 뒤 다시 합성
+4. adb logcat에서 다음을 확인:
+   SYNTH_APPLIED voice=... speed=... steps=...
+   SYNTH_PROFILE ...voice=...;speed=...;steps=...
+
+Android TextToSpeechService는 onLoadVoice()가 synthesis 전에 반드시 호출된다는 보장이 없으므로,
+이 프로젝트는 synthesis 시점에 request.voiceName을 우선하고, 없으면 최신 TtsSettings를 사용합니다.
+
+오디오 문제 확인
+- Peak/RMS: 전체 PCM의 실제 레벨
+- Leading/Trailing silence: 앞/뒤 무음 시간
+- Chunks: 내부 텍스트 분할 횟수
+- Chunk silence: 현재 0 ms
+
+현재 Backend
+- Soniqo Supertonic-3 LiteRT
+- CPU backend

@@ -1,0 +1,22 @@
+TTFA / CHUNK PRE-GENERATION / CHUNK SIZE / ICON PATCH
+
+Implemented:
+- Chunk size modes: conservative=40, balanced=64, long=88, manual=24..96 codepoints.
+- Chunk setting persisted in SharedPreferences and applied to System TTS and in-app synthesis.
+- Native Supertonic chunk streaming now emits the first playable audio chunk before the full sentence is finished.
+- 5 ms chunk seam crossfade is retained for streamed audio by holding a short tail and blending it into the next chunk.
+- Conservative edge-silence trimming remains enabled; explicit added chunk silence remains 0 ms.
+- System TTS at effective 1.00x uses synthesizeStreaming(); non-1.00x keeps whole-wave Sonic speed processing to avoid per-chunk time-stretch seams.
+- TTFA is measured from SpeechTextToSpeechService request entry to the first successful audioAvailable() call.
+- Native performance profile now includes ttfa_ms, streamed_chunks, and chunk_cap.
+- Launcher icon resources for legacy / v21 / v26 all use the same vector resource, avoiding adaptive-icon-only mismatch between APK preview and installed icon.
+- Version bumped to 3.4.7 / versionCode 5.
+
+Manual chunk range:
+- 24..96 codepoints.
+- The native tokenizer still validates normalized/wrapped text against the fixed 128-codepoint graph input.
+- A duration-overflow safeguard can recursively split an overlong chunk even when the user selected a large chunk cap.
+
+Validation:
+- speech-core/src/models/litert/litert_supertonic_tts.cpp passes clang++ -std=c++17 -fsyntax-only with the vendored speech-core headers.
+- Full Gradle Android build was not possible because Gradle 8.13 and Android SDK/JNI headers are not available/offline in this environment.

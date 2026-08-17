@@ -1,0 +1,16 @@
+# Patch notes — 2026-08-16
+
+- Supertonic duration-overflow retry splitting now prefers whitespace/word boundaries
+  and punctuation instead of blindly splitting at the UTF-32 midpoint. This prevents
+  cases such as `황금 / 기 시절`.
+- Mixed-language handling now respects a user-controlled `na` opt-in:
+  - selected `ko` + mixed text => `ko` by default
+  - selected `ko` + mixed text + `혼합 언어일 때 na 사용 허용` checked => `na`
+  - selected `na` => `na`
+  - the same preference is used by the Android system TTS service.
+- TTS regex settings UI no longer uses raw pixel heights (e.g. 52/56 px), which
+  caused flattened controls on higher-density screens. Buttons now use WRAP_CONTENT.
+- Speed/custom-voice behavior is unchanged.
+
+Build note: the supplied Gradle wrapper could not be built in this environment because
+Gradle 8.13 was not cached and outbound network access was unavailable.

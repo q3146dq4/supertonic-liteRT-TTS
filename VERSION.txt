@@ -1,0 +1,1 @@
+SupertonicTTS v3.4.7 - System TTS + adaptive anti-truncation + in-app regex manager + custom voice delete

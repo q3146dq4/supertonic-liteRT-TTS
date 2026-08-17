@@ -1,0 +1,13 @@
+UI cleanup patch
+
+- Custom Voice JSON 가져오기 -> Custom Voice 가져오기
+- Custom Voice 관리 -> Custom Voice 삭제
+- Main pronunciation buttons: 정규식 설정 / 가져오기 / 내보내기
+- START (생성→재생) -> START
+- PronunciationRulesActivity title and manifest label: 정규식 설정
+- Custom Voice deletion dialog title updated to 삭제 intent
+- Launcher foreground unified to sky-blue (#29B6F6)
+- Added legacy mipmap launcher vector fallbacks so pre-install/APK icon renderers do not fall back to an older green icon.
+
+Build verification note:
+- Gradle assembleDebug could not be executed in this environment because Gradle 8.13 was not cached and services.gradle.org is unreachable.

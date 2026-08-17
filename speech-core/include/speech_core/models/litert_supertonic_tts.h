@@ -1,0 +1,156 @@
+#pragma once
+
+#include "speech_core/interfaces.h"
+#include "speech_core/models/supertonic_tokenizer.h"
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <future>
+#include <thread>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace speech_core {
+
+/// Supertonic-3 — 99M non-autoregressive flow-matching multilingual TTS via LiteRT.
+/// Android build uses the four Soniqo LiteRT graphs: duration predictor, text encoder,
+/// vector estimator, and vocoder. Output is 44.1 kHz and G2P-free.
+class LiteRTSupertonicTts : public TTSInterface {
+public:
+    LiteRTSupertonicTts(const std::string& duration_path,
+                        const std::string& text_encoder_path,
+                        const std::string& vector_estimator_path,
+                        const std::string& vocoder_path,
+                        const std::string& tokenizer_dir,
+                        const std::string& voice_styles_dir,
+                        bool hw_accel = false,
+                        int num_threads = 4);
+    ~LiteRTSupertonicTts() override;
+
+    void synthesize(const std::string& text,
+                    const std::string& language,
+                    TTSChunkCallback on_chunk) override;
+    int output_sample_rate() const override { return 44100; }
+    void cancel() override;
+
+    void set_voice(const std::string& voice_id);
+    void set_total_step(int total_step);
+    void set_num_threads(int num_threads) { num_threads_ = std::max(1, std::min(64, num_threads)); }
+    void set_chunk_cap(int chunk_cap);
+    void set_pre_generation(bool enabled);
+    bool pre_generation() const { return pre_generation_; }
+    void set_pre_generation_queue(int depth);
+    int pre_generation_queue() const { return pre_generation_queue_; }
+    void set_chunk_gap_ms(int min_ms, int max_ms);
+    void set_trailing_silence_trim_ms(int trim_ms);
+    int num_threads() const { return num_threads_; }
+    void set_speed(float speed) { speed_ = std::max(0.25f, std::min(3.0f, speed)); }
+    void set_seed(uint32_t seed) { seed_ = seed; }
+    uint32_t seed_used() const { return seed_used_; }
+    void set_chunk_silence(float seconds) { chunk_silence_s_ = seconds; }
+    std::vector<std::string> voices() const;
+    const std::vector<float>& last_pcm() const { return last_pcm_; }
+
+    /// Timing breakdown for the last synthesis. Values are milliseconds.
+    std::string performance_profile() const;
+
+private:
+    struct VoiceStyle {
+        std::vector<float> style_ttl;
+        std::vector<float> style_dp;
+    };
+
+    struct PerformanceProfile {
+        double duration_predictor_ms = 0.0;
+        double text_encoder_ms = 0.0;
+        double vocoder_ms = 0.0;
+        double tensor_copy_ms = 0.0;
+        double total_ms = 0.0;
+        int chunk_count = 0;
+        int truncated_chunks = 0;
+        double peak = 0.0;
+        double rms = 0.0;
+        double leading_silence_ms = 0.0;
+        double trailing_silence_ms = 0.0;
+        double ttfa_ms = 0.0;
+        int streamed_chunks = 0;
+        double max_chunk_gap_ms = 0.0;
+        double avg_chunk_gap_ms = 0.0;
+        int chunk_gap_count = 0;
+        int pregen_used_chunks = 0;
+        int pregen_queue_depth = 0;
+        int chunk_gap_over_max_count = 0;
+        std::vector<double> ve_step_ms;
+        void reset() {
+            duration_predictor_ms = 0.0;
+            text_encoder_ms = 0.0;
+            vocoder_ms = 0.0;
+            tensor_copy_ms = 0.0;
+            total_ms = 0.0;
+            chunk_count = 0;
+            truncated_chunks = 0;
+            peak = 0.0;
+            rms = 0.0;
+            leading_silence_ms = 0.0;
+            trailing_silence_ms = 0.0;
+            ttfa_ms = 0.0;
+            streamed_chunks = 0;
+            max_chunk_gap_ms = 0.0;
+            avg_chunk_gap_ms = 0.0;
+            chunk_gap_count = 0;
+            pregen_used_chunks = 0;
+            pregen_queue_depth = 0;
+            chunk_gap_over_max_count = 0;
+            ve_step_ms.clear();
+        }
+    };
+
+    std::vector<float> synth_chunk(const std::string& chunk,
+                                   const std::string& language,
+                                   size_t chunk_index);
+    const VoiceStyle& current_voice() const;
+    void destroy_graphs() noexcept;
+
+    struct InterpreterState;
+    std::unique_ptr<InterpreterState> interp_;
+
+    std::unique_ptr<SupertonicTokenizer> tokenizer_;
+    std::unordered_map<std::string, VoiceStyle> voices_;
+    std::string voice_id_ = "F1";
+
+    static constexpr int kTextT = 128;
+    static constexpr int kLatentChannels = 144;
+    static constexpr int kChunkSamples = 512 * 6;
+    static constexpr int kVecEstLMin = 17;
+    static constexpr int kStyleTtlFloats = 50 * 256;
+    static constexpr int kStyleDpFloats = 8 * 16;
+    static constexpr int kSampleRate = 44100;
+
+    int total_step_ = 4;
+    int num_threads_ = 4;
+    int chunk_cap_ = 64;
+    float speed_ = 1.0f;
+    uint32_t seed_ = 0;
+    uint32_t seed_used_ = 0;
+    float chunk_silence_s_ = 0.0f;
+    int pre_generation_queue_ = 2;
+    int chunk_gap_min_ms_ = 0;
+    int chunk_gap_max_ms_ = 250;
+    int trailing_silence_trim_ms_ = 220;
+    bool pre_generation_ = true;
+    std::vector<std::unique_ptr<LiteRTSupertonicTts>> pregen_engines_;
+    std::string duration_path_;
+    std::string text_encoder_path_;
+    std::string vector_estimator_path_;
+    std::string vocoder_path_;
+    std::string tokenizer_dir_;
+    std::string voice_styles_dir_;
+    std::atomic<bool> cancelled_{false};
+    PerformanceProfile profile_{};
+    std::vector<float> last_pcm_;
+};
+
+} // namespace speech_core

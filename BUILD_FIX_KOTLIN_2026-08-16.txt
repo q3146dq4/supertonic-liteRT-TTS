@@ -1,0 +1,10 @@
+Build fix 2026-08-16
+
+Error:
+MainActivity.kt:170:13 Unresolved reference 'singleLine'
+
+Fix:
+Replaced Kotlin property-style `singleLine = true` with the Android EditText API
+call `setSingleLine(true)`, which is valid for the current Android/Kotlin setup.
+
+No other source changes were made for this build error.
