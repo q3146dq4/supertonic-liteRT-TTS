@@ -1225,29 +1225,6 @@ This README describes the resulting behavior of the current codebase.
 
 This repository is licensed under:
 
-```text
-Apache License 2.0
-```
-
-See:
-
-```text
-LICENSE
-```
-
-for the full license text.
-
-Third-party components may have their own licenses.
-
-See:
-
-```text
-THIRD-PARTY-SONIC-NOTICE.txt
-speech-core/THIRD-PARTY-NOTICES.md
-```
-
-for additional notices.
-
 ---
 
 # Acknowledgements
