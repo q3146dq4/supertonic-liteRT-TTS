@@ -8,7 +8,7 @@ This project packages Supertonic 3 as a native Android TTS engine and exposes it
 
 The synthesis backend runs locally on the device. After the model bundle has been downloaded, speech synthesis itself does not require a network connection.
 
-> **Current project version:** SupertonicTTS v3.4.7
+> **Current project version:** SupertonicLiteRT-v0.1
 > **Backend:** Supertonic 3 / LiteRT / 4 graphs
 > **Android TTS:** Supported
 > **Minimum Android version:** Android 8.0 / API 26
