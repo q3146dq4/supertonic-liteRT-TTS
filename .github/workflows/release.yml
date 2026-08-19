@@ -38,23 +38,34 @@ jobs:
           chmod +x setup.sh
           bash setup.sh
 
-      - name: Build debug APK
+      - name: Build APK
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Prepare release APK
+      - name: Prepare APK
         run: |
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk \
             "dist/Supertonic-LiteRT-${GITHUB_REF_NAME}-debug.apk"
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            "dist/Supertonic-LiteRT-${GITHUB_REF_NAME}-debug.apk" \
-            --verify-tag \
-            --generate-notes \
-            --title "Supertonic LiteRT ${GITHUB_REF_NAME}"
+          APK="dist/Supertonic-LiteRT-${GITHUB_REF_NAME}-debug.apk"
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            echo "Creating Release ${GITHUB_REF_NAME}..."
+            gh release create "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --generate-notes \
+              --title "Supertonic LiteRT ${GITHUB_REF_NAME}"
+          fi
+
+          echo "Uploading APK..."
+          gh release upload "${GITHUB_REF_NAME}" \
+            "$APK" \
+            --clobber
