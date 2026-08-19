@@ -16,6 +16,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import audio.soniqo.speech.ModelManager
+import audio.soniqo.speech.InferenceBackend
 import audio.soniqo.speech.SpeechSynthesizer
 import audio.soniqo.speech.SpeechSynthesizerConfig
 import audio.soniqo.speech.TtsSettings
@@ -41,6 +42,7 @@ class MainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var modelJob: Job? = null
     private var synthJob: Job? = null
+    private var benchmarkJob: Job? = null
     private var player: MediaPlayer? = null
     private var synthesizer: SpeechSynthesizer? = null
     private var engineInitSeconds = 0.0
@@ -51,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var voiceSpinner: Spinner
     private lateinit var stepsSpinner: Spinner
     private lateinit var threadsSpinner: Spinner
+    private lateinit var backendSpinner: Spinner
     private lateinit var chunkSpinner: Spinner
     private lateinit var chunkManualInput: EditText
     private lateinit var preGenerationSpinner: Spinner
@@ -65,8 +68,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var playButton: Button
 
     private val builtinVoices = listOf("F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5")
-    private val steps = listOf(4, 5, 6, 8, 10, 12)
-    private val threadCounts = listOf(2, 4, 8)
+    // Expose the full practical range instead of a few presets.
+    private val steps = (1..64).toList()
+    private val threadCounts = (1..8).toList()
+    private val benchmarkThreadCounts = (1..8).toList()
+    private val backends = listOf(
+        "CPU / XNNPACK" to InferenceBackend.CPU_XNNPACK,
+        "GPU 실험적 / 자동 품질검사·CPU 복구" to InferenceBackend.GPU_LITERT,
+        "NNAPI 실험적 / 자동 품질검사·CPU 복구" to InferenceBackend.NNAPI_DEVICE,
+        "Qualcomm NPU/HTP 실험적 / Snapdragon 전용" to InferenceBackend.QUALCOMM_NPU,
+    )
     private val chunkModes = listOf(
         "보수적 · 짧게 (40)" to TtsSettings.CHUNK_CONSERVATIVE,
         "균형 · 기본 (64)" to TtsSettings.CHUNK_BALANCED,
@@ -148,7 +159,12 @@ class MainActivity : AppCompatActivity() {
 
         speedLabel = TextView(this).apply { textSize = 16f }
         root.addView(speedLabel)
-        speedBar = SeekBar(this).apply { max = 55 }
+        speedBar = SeekBar(this).apply {
+            max = 55
+            // 0.25 + (15 * 0.05) = 1.00. Avoid briefly exposing the SeekBar's
+            // zero-position value before restoreSettings() applies preferences.
+            progress = 15
+        }
         root.addView(speedBar)
 
         root.addView(TextView(this).apply { text = "Flow matching steps (빠름 ↔ 품질)"; textSize = 16f; setPadding(0, 12, 0, 4) })
@@ -231,9 +247,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        root.addView(TextView(this).apply { text = "Inference backend"; textSize = 16f; setPadding(0, 12, 0, 4) })
+        backendSpinner = Spinner(this)
+        backendSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, backends.map { it.first })
+        root.addView(backendSpinner)
         root.addView(TextView(this).apply {
-            text = "Backend\nSoniqo Supertonic-3 LiteRT · CPU (current speech-core runtime)"
-            textSize = 14f; setPadding(0, 12, 0, 4)
+            text = "기본 Backend는 CPU/XNNPACK입니다. RTF는 생성 시간÷음성 길이이며 낮을수록 빠릅니다. Snapdragon 8 Elite Gen 5 기기의 동일 설정 End-to-end RTF는 CPU 0.188, QNN GPU hybrid 0.260, NNAPI 1.936으로 CPU가 가장 빨랐습니다. 테스트한 Helio G99 기기에서는 GPU가 비유한 출력으로 실패했고, NNAPI는 RTF 2.148에 Audio peak 0.029 / RMS 0.002의 손상된 바람 소리를 냈습니다. 따라서 GPU·NNAPI·NPU는 모두 실험적입니다. 앱은 NaN/Inf뿐 아니라 비정상 저에너지/과대 출력을 검사하고, 첫 음성이 전달되기 전에 실패하면 같은 요청을 CPU로 한 번 자동 재실행합니다. NPU 선택은 삭제하지 않았지만 공개 FP32 모델의 HTP Encoder·VE는 차단하고 HTP Vocoder probe만 보존했습니다. 프로세스를 종료시킨 DSP VE 경로는 사용하지 않습니다."
+            textSize = 13f; setPadding(0, 0, 0, 8)
         })
 
         root.addView(TextView(this).apply { text = "테스트 언어"; textSize = 16f; setPadding(0, 12, 0, 4) })
@@ -258,7 +278,7 @@ class MainActivity : AppCompatActivity() {
         textInput = EditText(this).apply {
             minLines = 6; maxLines = 14; gravity = android.view.Gravity.TOP
             hint = "여기에 테스트 문장을 입력하세요"
-            setText("안녕하세요. Supertonic LiteRT 시스템 엔진 테스트입니다. 이것은 차세대 kaldi를 사용하는 텍스트 음성 변환 엔진입니다.")
+            setText("안녕하세요. Supertonic-3 LiteRT 시스템 TTS 엔진 테스트입니다. 한국어 음성 합성 성능과 품질을 확인하기 위한 테스트 문장입니다.")
         }
         root.addView(textInput)
 
@@ -283,6 +303,19 @@ class MainActivity : AppCompatActivity() {
         row1.addView(playButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         row1.addView(stop, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(row1)
+        root.addView(Button(this).apply {
+            text = "논스트리밍 벤치마크 · 1~8 threads"
+            setOnClickListener { startNonStreamingBenchmark() }
+        })
+        root.addView(Button(this).apply {
+            text = "스트리밍 벤치마크 · 1~8 threads"
+            setOnClickListener { startStreamingBenchmark() }
+        })
+        root.addView(TextView(this).apply {
+            text = "두 thread 벤치마크는 Backend 선택과 무관하게 CPU/XNNPACK으로 고정하고, 현재 Voice / Steps / Chunk / 테스트 언어를 유지한 채 CPU threads만 1~8까지 순차 측정합니다. GPU/NNAPI/NPU는 위 Backend에서 선택 후 START로 측정하세요. 자동 CPU 복구가 발생하면 PERFORMANCE PROFILE의 Requested/Active backend와 Fallback reason에 표시됩니다. 논스트리밍은 순수 전체 합성 성능, 스트리밍은 실제 chunk callback 기준 TTFA / callback gap / RTF를 함께 측정합니다. 스트리밍 벤치마크는 현재 '다음 청크 미리 생성' 설정을 그대로 사용하며 자동 재생은 하지 않습니다."
+            textSize = 13f
+            setPadding(0, 2, 0, 8)
+        })
         root.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             val save = Button(this@MainActivity).apply { text = "SAVE WAV"; setOnClickListener { saveLast() } }
@@ -299,15 +332,17 @@ class MainActivity : AppCompatActivity() {
         })
 
         setContentView(android.widget.ScrollView(this).apply { addView(root) })
-        // Deliberately keep the first playback at normal speed.
+        // Keep the label synchronized with the initialized SeekBar even before
+        // restoreSettings() replaces it with the persisted value.
         updateSpeedLabel()
     }
 
     private fun restoreSettings() {
         val savedVoice = TtsSettings.voice(this)
         voiceSpinner.setSelection(voiceIds.indexOf(savedVoice).takeIf { it >= 0 } ?: 0)
-        stepsSpinner.setSelection(steps.indexOf(TtsSettings.steps(this)).takeIf { it >= 0 } ?: 0)
-        threadsSpinner.setSelection(threadCounts.indexOf(TtsSettings.threads(this)).takeIf { it >= 0 } ?: 1)
+        stepsSpinner.setSelection(steps.indexOf(TtsSettings.steps(this)).takeIf { it >= 0 } ?: steps.indexOf(4))
+        threadsSpinner.setSelection(threadCounts.indexOf(TtsSettings.threads(this)).takeIf { it >= 0 } ?: threadCounts.indexOf(4))
+        backendSpinner.setSelection(backends.indexOfFirst { it.second == TtsSettings.backend(this) }.takeIf { it >= 0 } ?: 0)
         chunkSpinner.setSelection(chunkModes.indexOfFirst { it.second == TtsSettings.chunkMode(this) }.takeIf { it >= 0 } ?: 1)
         chunkManualInput.setText(TtsSettings.manualChunkCap(this).toString())
         chunkManualInput.visibility = if (TtsSettings.chunkMode(this) == TtsSettings.CHUNK_MANUAL) android.view.View.VISIBLE else android.view.View.GONE
@@ -317,6 +352,13 @@ class MainActivity : AppCompatActivity() {
         trailingTrimInput.setText(TtsSettings.trailingSilenceTrimMs(this).toString())
         val savedSpeed = TtsSettings.speed(this).coerceIn(0.25f, 3.0f)
         speedBar.progress = ((savedSpeed - 0.25f) / 0.05f).roundToInt().coerceIn(0, speedBar.max)
+        // Listeners are intentionally attached only after restoration, so a
+        // programmatic progress change above does not trigger onProgressChanged.
+        // Refresh the visible value explicitly; otherwise 1.00 can be applied
+        // internally while the first-render label remains at 0.25.
+        updateSpeedLabel()
+        val savedTestLanguage = TtsSettings.testLanguage(this)
+        languageSpinner.setSelection(languages.indexOfFirst { it.second == savedTestLanguage }.takeIf { it >= 0 } ?: 0)
     }
 
     private fun refreshVoices(selected: String? = TtsSettings.voice(this)) {
@@ -360,6 +402,15 @@ class MainActivity : AppCompatActivity() {
                 synthesizer = null
             }
         }
+        backendSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                val backend = currentBackend()
+                TtsSettings.setBackend(this@MainActivity, backend)
+                synthesizer?.close()
+                synthesizer = null
+            }
+        }
         chunkSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
@@ -395,6 +446,13 @@ class MainActivity : AppCompatActivity() {
         chunkGapMaxInput.setOnFocusChangeListener { _, hasFocus -> if (!hasFocus) commitStreamingControls() }
         trailingTrimInput.setOnFocusChangeListener { _, hasFocus -> if (!hasFocus) commitStreamingControls() }
 
+        languageSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                TtsSettings.setTestLanguage(this@MainActivity, currentLanguage())
+            }
+        }
+
         speedBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 updateSpeedLabel()
@@ -418,6 +476,7 @@ class MainActivity : AppCompatActivity() {
     private fun currentVoice(): String = voiceIds[voiceSpinner.selectedItemPosition.coerceIn(0, voiceIds.lastIndex)]
     private fun currentSteps(): Int = steps[stepsSpinner.selectedItemPosition.coerceIn(0, steps.lastIndex)]
     private fun currentThreads(): Int = threadCounts[threadsSpinner.selectedItemPosition.coerceIn(0, threadCounts.lastIndex)]
+    private fun currentBackend(): InferenceBackend = backends[backendSpinner.selectedItemPosition.coerceIn(0, backends.lastIndex)].second
     private fun currentChunkMode(): String = chunkModes[chunkSpinner.selectedItemPosition.coerceIn(0, chunkModes.lastIndex)].second
     private fun currentManualChunkCap(): Int = chunkManualInput.text?.toString()?.toIntOrNull()?.coerceIn(TtsSettings.MIN_CHUNK_CAP, TtsSettings.MAX_CHUNK_CAP) ?: TtsSettings.manualChunkCap(this)
     private fun currentChunkCap(): Int = when (currentChunkMode()) {
@@ -436,6 +495,8 @@ class MainActivity : AppCompatActivity() {
         TtsSettings.save(this, currentVoice(), currentSpeed(), currentSteps(), currentThreads(), currentChunkMode(), currentManualChunkCap())
         TtsSettings.setPreGeneration(this, preGenerationSpinner.selectedItemPosition > 0)
         TtsSettings.setStreamingControls(this, preGenerationQueue(), currentChunkGapMin(), currentChunkGapMax(), currentTrailingTrim())
+        TtsSettings.setTestLanguage(this, currentLanguage())
+        TtsSettings.setBackend(this, currentBackend())
     }
 
     private fun ensureModel(force: Boolean = false) {
@@ -545,9 +606,318 @@ class MainActivity : AppCompatActivity() {
         if (::ruleStatus.isInitialized) ruleStatus.text = "발음/정규식 규칙: ${PronunciationRules.count(this)}개"
     }
 
+    private fun startNonStreamingBenchmark() {
+        if (!ModelManager.areTtsModelsReady(this)) {
+            ensureModel()
+            Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (benchmarkJob?.isActive == true) {
+            Toast.makeText(this, "벤치마크가 이미 실행 중입니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        persistUiSettings()
+        player?.stop(); player?.release(); player = null
+        if (synthJob?.isActive == true) synthesizer?.stop()
+        synthJob?.cancel()
+        synthesizer?.close(); synthesizer = null
+
+        val original = textInput.text?.toString()?.trim().orEmpty()
+        if (original.isBlank()) {
+            Toast.makeText(this, "벤치마크할 테스트 문장을 입력하세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val text = PronunciationRules.apply(this, original)
+        val voice = currentVoice()
+        val stepCount = currentSteps()
+        val selectedLang = currentLanguage()
+        val lang = if (selectedLang == "na" || (allowNaCheck.isChecked && PronunciationRules.isMixedScript(text))) "na" else selectedLang
+        val chunkCap = currentChunkCap()
+        val pregenQueue = preGenerationQueue()
+        val gapMin = currentChunkGapMin()
+        val gapMax = currentChunkGapMax()
+        val trailingTrim = currentTrailingTrim()
+        val originalThreads = currentThreads()
+
+        data class BenchResult(
+            val threads: Int,
+            val nativeMs: Double,
+            val durationSec: Double,
+            val rtf: Double,
+            val veMs: Double,
+            val vocoderMs: Double,
+            val engineInitMs: Double,
+        )
+
+        benchmarkJob = scope.launch {
+            status.text = "논스트리밍 벤치마크 시작… · Steps=$stepCount · Chunk=$chunkCap · Lang=$lang"
+            rtfView.text = ""
+            val results = mutableListOf<BenchResult>()
+            runCatching {
+                for ((index, threads) in benchmarkThreadCounts.withIndex()) {
+                    withContext(Dispatchers.Main) {
+                        status.text = "논스트리밍 ${index + 1}/${benchmarkThreadCounts.size} · ${threads} threads…"
+                    }
+                    val result = withContext(Dispatchers.Default) {
+                        val initStart = System.nanoTime()
+                        val benchSynth = SpeechSynthesizer(SpeechSynthesizerConfig(
+                            modelDir = ModelManager.modelDir(applicationContext).absolutePath,
+                            voiceId = voice,
+                            speed = 1.0f,
+                            totalSteps = stepCount,
+                            numThreads = threads,
+                            chunkCap = chunkCap,
+                            useNnapi = false,
+                            backend = InferenceBackend.CPU_XNNPACK,
+                            preGenerationQueue = pregenQueue,
+                            chunkGapMinMs = gapMin,
+                            chunkGapMaxMs = gapMax,
+                            trailingSilenceTrimMs = trailingTrim,
+                        ))
+                        val initMs = (System.nanoTime() - initStart) / 1_000_000.0
+                        try {
+                            benchSynth.setVoice(voice)
+                            benchSynth.setSpeed(1.0f)
+                            benchSynth.setTotalSteps(stepCount)
+                            // Keep speculative pre-generation off for a fair CPU-thread comparison.
+                            benchSynth.setPreGeneration(false)
+                            val value = benchSynth.synthesize(text, lang)
+                            val profile = parseProfile(value.profile)
+                            val nativeMs = (profile["total"] as? Double) ?: 0.0
+                            val durationSec = value.pcm16.size / 2.0 / value.sampleRate
+                            val veMs = (profile["ve_steps"] as? List<*>)?.sumOf { (it as? Double) ?: 0.0 } ?: 0.0
+                            val vocoderMs = (profile["vocoder"] as? Double) ?: 0.0
+                            BenchResult(
+                                threads = threads,
+                                nativeMs = nativeMs,
+                                durationSec = durationSec,
+                                rtf = if (durationSec > 0.0) nativeMs / 1000.0 / durationSec else Double.POSITIVE_INFINITY,
+                                veMs = veMs,
+                                vocoderMs = vocoderMs,
+                                engineInitMs = initMs,
+                            )
+                        } finally {
+                            benchSynth.close()
+                        }
+                    }
+                    results += result
+                    withContext(Dispatchers.Main) {
+                        val partial = results.joinToString("\n") {
+                            String.format(Locale.US, "%dT  Native %.3fs  RTF %.3f", it.threads, it.nativeMs / 1000.0, it.rtf)
+                        }
+                        rtfView.text = "NON-STREAMING THREAD BENCHMARK\n$partial"
+                    }
+                }
+            }.onFailure { e ->
+                withContext(Dispatchers.Main) {
+                    status.text = "벤치마크 실패: ${e.message ?: e.javaClass.simpleName}"
+                }
+            }.onSuccess {
+                val sorted = results.sortedBy { it.rtf }
+                val best = sorted.firstOrNull()
+                withContext(Dispatchers.Main) {
+                    val sb = StringBuilder("NON-STREAMING THREAD BENCHMARK\n")
+                    sb.append("고정 조건: Steps=$stepCount · Chunk=$chunkCap · Lang=$lang\n\n")
+                    sb.append("Threads | Native | RTF | VE total | Vocoder | Init\n")
+                    for (r in results) {
+                        sb.append(String.format(Locale.US, "%dT      %.3fs   %.3f   %.1fms   %.1fms   %.0fms\n",
+                            r.threads, r.nativeMs / 1000.0, r.rtf, r.veMs, r.vocoderMs, r.engineInitMs))
+                    }
+                    if (best != null) {
+                        sb.append("\nBEST: ${best.threads} threads · RTF ${String.format(Locale.US, "%.3f", best.rtf)} · Native ${String.format(Locale.US, "%.3f", best.nativeMs / 1000.0)}s")
+                    }
+                    rtfView.text = sb.toString()
+                    status.text = "논스트리밍 벤치마크 완료${best?.let { " · 최적 ${it.threads} threads" } ?: ""}"
+                    // Benchmark is observational only: restore the user's selected thread setting.
+                    threadsSpinner.setSelection(threadCounts.indexOf(originalThreads).coerceAtLeast(0))
+                    synthesizer?.close(); synthesizer = null
+                }
+            }
+        }
+    }
+
+    private fun startStreamingBenchmark() {
+        if (!ModelManager.areTtsModelsReady(this)) {
+            ensureModel()
+            Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (benchmarkJob?.isActive == true) {
+            Toast.makeText(this, "벤치마크가 이미 실행 중입니다.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        persistUiSettings()
+        player?.stop(); player?.release(); player = null
+        if (synthJob?.isActive == true) synthesizer?.stop()
+        synthJob?.cancel()
+        synthesizer?.close(); synthesizer = null
+
+        val original = textInput.text?.toString()?.trim().orEmpty()
+        if (original.isBlank()) {
+            Toast.makeText(this, "벤치마크할 테스트 문장을 입력하세요.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val text = PronunciationRules.apply(this, original)
+        val voice = currentVoice()
+        val stepCount = currentSteps()
+        val selectedLang = currentLanguage()
+        val lang = if (selectedLang == "na" || (allowNaCheck.isChecked && PronunciationRules.isMixedScript(text))) "na" else selectedLang
+        val chunkCap = currentChunkCap()
+        val pregenEnabled = preGenerationSpinner.selectedItemPosition > 0
+        val pregenQueue = preGenerationQueue()
+        val gapMin = currentChunkGapMin()
+        val gapMax = currentChunkGapMax()
+        val trailingTrim = currentTrailingTrim()
+        val originalThreads = currentThreads()
+
+        data class StreamBenchResult(
+            val threads: Int,
+            val nativeMs: Double,
+            val wallMs: Double,
+            val durationSec: Double,
+            val rtf: Double,
+            val wallRtf: Double,
+            val ttfaMs: Double,
+            val nativeTtfaMs: Double,
+            val callbacks: Int,
+            val maxCallbackGapMs: Double,
+            val avgCallbackGapMs: Double,
+            val nativeMaxGapMs: Double,
+            val nativeAvgGapMs: Double,
+            val veMs: Double,
+            val vocoderMs: Double,
+            val engineInitMs: Double,
+        )
+
+        benchmarkJob = scope.launch {
+            status.text = "스트리밍 벤치마크 시작… · Steps=$stepCount · Chunk=$chunkCap · Lang=$lang · Pregen=${if (pregenEnabled) pregenQueue else "OFF"}"
+            rtfView.text = ""
+            val results = mutableListOf<StreamBenchResult>()
+            runCatching {
+                for ((index, threads) in benchmarkThreadCounts.withIndex()) {
+                    withContext(Dispatchers.Main) {
+                        status.text = "스트리밍 ${index + 1}/${benchmarkThreadCounts.size} · ${threads} threads…"
+                    }
+                    val result = withContext(Dispatchers.Default) {
+                        val initStart = System.nanoTime()
+                        val benchSynth = SpeechSynthesizer(SpeechSynthesizerConfig(
+                            modelDir = ModelManager.modelDir(applicationContext).absolutePath,
+                            voiceId = voice,
+                            speed = 1.0f,
+                            totalSteps = stepCount,
+                            numThreads = threads,
+                            chunkCap = chunkCap,
+                            useNnapi = false,
+                            backend = InferenceBackend.CPU_XNNPACK,
+                            preGenerationQueue = pregenQueue,
+                            chunkGapMinMs = gapMin,
+                            chunkGapMaxMs = gapMax,
+                            trailingSilenceTrimMs = trailingTrim,
+                        ))
+                        val initMs = (System.nanoTime() - initStart) / 1_000_000.0
+                        try {
+                            benchSynth.setVoice(voice)
+                            benchSynth.setSpeed(1.0f)
+                            benchSynth.setTotalSteps(stepCount)
+                            benchSynth.setPreGeneration(pregenEnabled)
+                            benchSynth.setPreGenerationQueue(pregenQueue)
+                            benchSynth.setChunkGap(gapMin, gapMax)
+                            benchSynth.setTrailingSilenceTrimMs(trailingTrim)
+
+                            val startNs = System.nanoTime()
+                            var firstAudioNs = 0L
+                            var previousAudioNs = 0L
+                            var totalBytes = 0L
+                            var callbackCount = 0
+                            val callbackGaps = mutableListOf<Double>()
+
+                            benchSynth.synthesizeStreaming(text, lang) { pcm, _ ->
+                                if (pcm.isNotEmpty()) {
+                                    val now = System.nanoTime()
+                                    if (firstAudioNs == 0L) firstAudioNs = now
+                                    if (previousAudioNs != 0L) callbackGaps += (now - previousAudioNs) / 1_000_000.0
+                                    previousAudioNs = now
+                                    callbackCount++
+                                    totalBytes += pcm.size.toLong()
+                                }
+                            }
+                            val wallMs = (System.nanoTime() - startNs) / 1_000_000.0
+                            val profile = parseProfile(benchSynth.lastProfile())
+                            val nativeMs = (profile["total"] as? Double) ?: wallMs
+                            val durationSec = totalBytes / 2.0 / benchSynth.sampleRate
+                            val ttfaMs = if (firstAudioNs != 0L) (firstAudioNs - startNs) / 1_000_000.0 else 0.0
+                            val veMs = (profile["ve_steps"] as? List<*>)?.sumOf { (it as? Double) ?: 0.0 } ?: 0.0
+                            val vocoderMs = (profile["vocoder"] as? Double) ?: 0.0
+                            StreamBenchResult(
+                                threads = threads,
+                                nativeMs = nativeMs,
+                                wallMs = wallMs,
+                                durationSec = durationSec,
+                                rtf = if (durationSec > 0.0) nativeMs / 1000.0 / durationSec else Double.POSITIVE_INFINITY,
+                                wallRtf = if (durationSec > 0.0) wallMs / 1000.0 / durationSec else Double.POSITIVE_INFINITY,
+                                ttfaMs = ttfaMs,
+                                nativeTtfaMs = (profile["ttfa_ms"] as? Double) ?: 0.0,
+                                callbacks = callbackCount,
+                                maxCallbackGapMs = callbackGaps.maxOrNull() ?: 0.0,
+                                avgCallbackGapMs = if (callbackGaps.isNotEmpty()) callbackGaps.average() else 0.0,
+                                nativeMaxGapMs = (profile["max_chunk_gap_ms"] as? Double) ?: 0.0,
+                                nativeAvgGapMs = (profile["avg_chunk_gap_ms"] as? Double) ?: 0.0,
+                                veMs = veMs,
+                                vocoderMs = vocoderMs,
+                                engineInitMs = initMs,
+                            )
+                        } finally {
+                            benchSynth.close()
+                        }
+                    }
+                    results += result
+                    withContext(Dispatchers.Main) {
+                        val partial = results.joinToString("\n") {
+                            String.format(Locale.US, "%dT  TTFA %.0fms  RTF %.3f  Gap %.0fms", it.threads, it.ttfaMs, it.rtf, it.maxCallbackGapMs)
+                        }
+                        rtfView.text = "STREAMING THREAD BENCHMARK\n$partial"
+                    }
+                }
+            }.onFailure { e ->
+                withContext(Dispatchers.Main) {
+                    status.text = "스트리밍 벤치마크 실패: ${e.message ?: e.javaClass.simpleName}"
+                }
+            }.onSuccess {
+                // For actual perceived TTS responsiveness, rank primarily by TTFA, then by
+                // maximum callback starvation gap, then by overall RTF.
+                val best = results.minWithOrNull(compareBy<StreamBenchResult> { it.ttfaMs }.thenBy { it.maxCallbackGapMs }.thenBy { it.rtf })
+                withContext(Dispatchers.Main) {
+                    val sb = StringBuilder("STREAMING THREAD BENCHMARK\n")
+                    sb.append("고정 조건: Steps=$stepCount · Chunk=$chunkCap · Lang=$lang · Pregen=${if (pregenEnabled) pregenQueue else "OFF"}\n")
+                    sb.append("※ Speed는 실제 시스템 TTS의 streaming 경로와 동일하게 1.00x로 측정\n\n")
+                    sb.append("T | TTFA | Native RTF | Wall RTF | Max gap | Avg gap | Cb | Native | VE | Vocoder | Init\n")
+                    for (r in results) {
+                        sb.append(String.format(Locale.US,
+                            "%d | %.0fms | %.3f | %.3f | %.0fms | %.0fms | %d | %.3fs | %.0fms | %.0fms | %.0fms\n",
+                            r.threads, r.ttfaMs, r.rtf, r.wallRtf, r.maxCallbackGapMs, r.avgCallbackGapMs,
+                            r.callbacks, r.nativeMs / 1000.0, r.veMs, r.vocoderMs, r.engineInitMs))
+                    }
+                    if (best != null) {
+                        sb.append("\nBEST (체감 우선): ${best.threads} threads · TTFA ${String.format(Locale.US, "%.0f", best.ttfaMs)}ms · Max gap ${String.format(Locale.US, "%.0f", best.maxCallbackGapMs)}ms · RTF ${String.format(Locale.US, "%.3f", best.rtf)}")
+                    }
+                    sb.append("\n\nNative profile gap/TTFA도 내부적으로 함께 기록됩니다. 위 TTFA/Gap은 실제 Kotlin callback 도착 시각 기준이라 시스템 TTS 체감 비교에 더 직접적입니다.")
+                    rtfView.text = sb.toString()
+                    status.text = "스트리밍 벤치마크 완료${best?.let { " · 체감 최적 ${it.threads} threads" } ?: ""}"
+                    threadsSpinner.setSelection(threadCounts.indexOf(originalThreads).coerceAtLeast(0))
+                    synthesizer?.close(); synthesizer = null
+                }
+            }
+        }
+    }
+
     private fun startSynthesis() {
         if (!ModelManager.areTtsModelsReady(this)) { ensureModel(); Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show(); return }
-        persistUiSettings(); player?.stop(); player?.release(); player = null; synthJob?.cancel()
+        persistUiSettings(); player?.stop(); player?.release(); player = null
+        // Coroutine cancellation cannot interrupt a blocking JNI call. Explicitly signal
+        // the native engine as well, otherwise a newly launched synthesis can sit on the
+        // JNI mutex waiting for the previous cancelled job to finish.
+        if (synthJob?.isActive == true) synthesizer?.stop()
+        synthJob?.cancel()
         val original = textInput.text?.toString()?.trim().orEmpty()
         if (original.isBlank()) { Toast.makeText(this, "텍스트를 입력하세요.", Toast.LENGTH_SHORT).show(); return }
         val text = PronunciationRules.apply(this, original)
@@ -558,26 +928,73 @@ class MainActivity : AppCompatActivity() {
         status.text = "음성 생성 중…\nVoice=$voice · Speed=${String.format(Locale.US, "%.2f", speed)} · Steps=$stepCount · Chunk=${currentChunkCap()} · Lang=$lang"
         rtfView.text = ""
         synthJob = scope.launch {
-            val started = TimeSource.Monotonic.markNow()
+            val requestStartNs = System.nanoTime()
+            var workerDispatchWaitMs = 0.0
+            var engineAcquireMs = 0.0
+            var nativeSettingsMs = 0.0
+            var sdkSynthesizeMs = 0.0
+            var speedDispatchWaitMs = 0.0
             runCatching {
                 val value = withContext(Dispatchers.Default) {
+                    workerDispatchWaitMs = (System.nanoTime() - requestStartNs) / 1_000_000.0
+                    val engineStartNs = System.nanoTime()
                     val synth = getOrCreateSynthesizer(ModelManager.modelDir(applicationContext).absolutePath)
+                    engineAcquireMs = (System.nanoTime() - engineStartNs) / 1_000_000.0
+
+                    val settingsStartNs = System.nanoTime()
                     synth.setVoice(voice); synth.setSpeed(1.0f); synth.setTotalSteps(stepCount); synth.setPreGeneration(TtsSettings.preGeneration(applicationContext))
                     synth.setPreGenerationQueue(preGenerationQueue())
                     synth.setChunkGap(currentChunkGapMin(), currentChunkGapMax())
                     synth.setTrailingSilenceTrimMs(currentTrailingTrim())
-                    synth.synthesize(text, lang)
+                    nativeSettingsMs = (System.nanoTime() - settingsStartNs) / 1_000_000.0
+
+                    val sdkStartNs = System.nanoTime()
+                    val result = synth.synthesize(text, lang)
+                    sdkSynthesizeMs = (System.nanoTime() - sdkStartNs) / 1_000_000.0
+                    result
                 }
-                val adjusted = withContext(Dispatchers.Default) { AudioSpeedProcessor.apply(value.pcm16, value.sampleRate, speed) }
-                val elapsed = started.elapsedNow().inWholeMilliseconds / 1000.0
+
+                val speedDispatchStartNs = System.nanoTime()
+                val adjusted = withContext(Dispatchers.Default) {
+                    speedDispatchWaitMs = (System.nanoTime() - speedDispatchStartNs) / 1_000_000.0
+                    AudioSpeedProcessor.apply(value.pcm16, value.sampleRate, speed)
+                }
+                val preWavElapsed = (System.nanoTime() - requestStartNs) / 1_000_000_000.0
                 val duration = adjusted.pcm16.size / 2.0 / value.sampleRate
                 val profile = parseProfile(value.profile)
-                val nativeTotal = (profile["total"] as? Double)?.div(1000.0) ?: elapsed
+                val fallback = (profile["accelerator_fallback"] as? String)
+                    ?.takeUnless { it == "none" }
+                val nativeTotal = (profile["total"] as? Double)?.div(1000.0) ?: preWavElapsed
                 val wav = File(filesDir, "generated.wav")
+                val wavStartNs = System.nanoTime()
                 writeWav(wav, adjusted.pcm16, value.sampleRate, 1)
+                val wavWriteMs = (System.nanoTime() - wavStartNs) / 1_000_000.0
+                val totalToWav = (System.nanoTime() - requestStartNs) / 1_000_000_000.0
                 withContext(Dispatchers.Main) {
-                    status.text = "생성 완료 · 자동 재생 · ${String.format(Locale.US, "%.2f", duration)}초"
-                    rtfView.text = formatProfile(profile, elapsed, if (duration > 0) elapsed / duration else 0.0, duration, nativeTotal, adjusted.processingMs, speed, voice, stepCount, lang)
+                    status.text = if (fallback == null) {
+                        "생성 완료 · 자동 재생 · ${String.format(Locale.US, "%.2f", duration)}초"
+                    } else {
+                        "가속 출력 오류 → CPU 자동 복구 완료 · 자동 재생 · ${String.format(Locale.US, "%.2f", duration)}초"
+                    }
+                    rtfView.text = formatProfile(
+                        profile = profile,
+                        elapsed = preWavElapsed,
+                        rtf = if (duration > 0) preWavElapsed / duration else 0.0,
+                        duration = duration,
+                        nativeTotal = nativeTotal,
+                        speedProcessMs = adjusted.processingMs,
+                        appliedSpeed = speed,
+                        appliedVoice = voice,
+                        appliedSteps = stepCount,
+                        lang = lang,
+                        workerDispatchWaitMs = workerDispatchWaitMs,
+                        engineAcquireMs = engineAcquireMs,
+                        nativeSettingsMs = nativeSettingsMs,
+                        sdkSynthesizeMs = sdkSynthesizeMs,
+                        speedDispatchWaitMs = speedDispatchWaitMs,
+                        wavWriteMs = wavWriteMs,
+                        totalToWav = totalToWav,
+                    )
                     playButton.apply { isEnabled = true; playLast() }
                 }
             }.onFailure { e -> withContext(Dispatchers.Main) { status.text = "음성 생성 실패:\n${e.message ?: e.javaClass.simpleName}" } }
@@ -588,8 +1005,10 @@ class MainActivity : AppCompatActivity() {
         synthesizer?.let { return it }
         val started = TimeSource.Monotonic.markNow()
         return SpeechSynthesizer(SpeechSynthesizerConfig(
-            modelDir = dir, voiceId = currentVoice(), speed = 1.0f, totalSteps = currentSteps(), numThreads = currentThreads(), chunkCap = currentChunkCap(), useNnapi = false,
-            preGenerationQueue = preGenerationQueue(), chunkGapMinMs = currentChunkGapMin(), chunkGapMaxMs = currentChunkGapMax(), trailingSilenceTrimMs = currentTrailingTrim()
+            modelDir = dir, voiceId = currentVoice(), speed = 1.0f, totalSteps = currentSteps(), numThreads = currentThreads(), chunkCap = currentChunkCap(), useNnapi = false, backend = currentBackend(),
+            preGenerationQueue = preGenerationQueue(), chunkGapMinMs = currentChunkGapMin(), chunkGapMaxMs = currentChunkGapMax(), trailingSilenceTrimMs = currentTrailingTrim(),
+            nativeLibraryDir = applicationInfo.nativeLibraryDir,
+            acceleratorCacheDir = File(cacheDir, "accelerator_cache").apply { mkdirs() }.absolutePath
         )).also {
             engineInitSeconds = started.elapsedNow().inWholeMilliseconds / 1000.0
             synthesizer = it
@@ -609,7 +1028,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun formatProfile(profile: Map<String, Any>, elapsed: Double, rtf: Double, duration: Double, nativeTotal: Double,
-                              speedProcessMs: Double, appliedSpeed: Float, appliedVoice: String, appliedSteps: Int, lang: String): String {
+                              speedProcessMs: Double, appliedSpeed: Float, appliedVoice: String, appliedSteps: Int, lang: String,
+                              workerDispatchWaitMs: Double, engineAcquireMs: Double, nativeSettingsMs: Double,
+                              sdkSynthesizeMs: Double, speedDispatchWaitMs: Double, wavWriteMs: Double,
+                              totalToWav: Double): String {
         fun ms(key: String) = String.format(Locale.US, "%.1f ms", (profile[key] as? Double ?: 0.0))
         val stepValues = profile["ve_steps"] as? List<*> ?: emptyList<Any>()
         val sb = StringBuilder("PERFORMANCE PROFILE\n")
@@ -619,11 +1041,34 @@ class MainActivity : AppCompatActivity() {
         stepValues.forEachIndexed { i, v -> sb.append("VE Step ${i + 1}".padEnd(23)).append(String.format(Locale.US, "%.1f ms", (v as? Double ?: 0.0))).append('\n') }
         sb.append("Vocoder                ").append(ms("vocoder")).append('\n')
         sb.append("Tensor buffer/copy     ").append(ms("tensor_copy")).append('\n')
+        sb.append("Core chunking          ").append(ms("chunking")).append('\n')
+        sb.append("Core token process     ").append(ms("token_process")).append('\n')
+        sb.append("Core latent setup      ").append(ms("latent_setup")).append('\n')
+        sb.append("Core append/crossfade  ").append(ms("append")).append('\n')
+        sb.append("Core stream emit       ").append(ms("stream_emit")).append('\n')
+        sb.append("Core pregen cleanup    ").append(ms("pregen_cleanup")).append('\n')
+        sb.append("Core final postprocess ").append(ms("final_postprocess")).append('\n')
         sb.append("Native total           ").append(String.format(Locale.US, "%.3f s", nativeTotal)).append('\n')
         sb.append("End-to-end              ").append(String.format(Locale.US, "%.3f s", elapsed)).append('\n')
         sb.append("Audio duration          ").append(String.format(Locale.US, "%.3f s", duration)).append('\n')
         sb.append("Native RTF              ").append(String.format(Locale.US, "%.3f", if (duration > 0) nativeTotal / duration else 0.0)).append('\n')
         sb.append("End-to-end RTF          ").append(String.format(Locale.US, "%.3f", rtf)).append('\n')
+        sb.append("--- DIAGNOSTIC BREAKDOWN ---\n")
+        sb.append("Worker dispatch wait   ").append(String.format(Locale.US, "%.1f ms", workerDispatchWaitMs)).append('\n')
+        sb.append("Engine acquire/init     ").append(String.format(Locale.US, "%.1f ms", engineAcquireMs)).append('\n')
+        sb.append("Native settings JNI     ").append(String.format(Locale.US, "%.1f ms", nativeSettingsMs)).append('\n')
+        sb.append("SDK synthesize call     ").append(String.format(Locale.US, "%.1f ms", sdkSynthesizeMs)).append('\n')
+        sb.append("JNI mutex wait          ").append(ms("jni_lock_wait")).append('\n')
+        sb.append("JNI arg conversion      ").append(ms("jni_arg_convert")).append('\n')
+        sb.append("JNI core call           ").append(ms("jni_core")).append('\n')
+        sb.append("JNI PCM f32->s16        ").append(ms("jni_pcm_convert")).append('\n')
+        sb.append("JNI ByteArray alloc     ").append(ms("jni_bytearray_alloc")).append('\n')
+        sb.append("JNI ByteArray copy      ").append(ms("jni_bytearray_copy")).append('\n')
+        sb.append("JNI total               ").append(ms("jni_total")).append('\n')
+        sb.append("JNI PCM samples         ").append(profile["jni_pcm_samples"] ?: "?").append('\n')
+        sb.append("Speed dispatch wait     ").append(String.format(Locale.US, "%.1f ms", speedDispatchWaitMs)).append('\n')
+        sb.append("WAV write               ").append(String.format(Locale.US, "%.1f ms", wavWriteMs)).append('\n')
+        sb.append("Total incl. WAV         ").append(String.format(Locale.US, "%.3f s", totalToWav)).append('\n')
         sb.append("TTFA (native stream)    ").append(String.format(Locale.US, "%.1f ms", (profile["ttfa_ms"] as? Double ?: 0.0))).append('\n')
         sb.append("Speed processing        ").append(String.format(Locale.US, "%.1f ms", speedProcessMs)).append('\n')
         sb.append("Applied voice           ").append(appliedVoice).append('\n')
@@ -645,7 +1090,10 @@ class MainActivity : AppCompatActivity() {
         sb.append("Audio RMS               ").append(profile["rms"] ?: "?").append('\n')
         sb.append("Leading silence         ").append(profile["lead_silence_ms"] ?: "?").append(" ms\n")
         sb.append("Trailing silence        ").append(profile["trail_silence_ms"] ?: "?").append(" ms\n")
-        sb.append("Backend                 Soniqo Supertonic-3 LiteRT CPU").append('\n')
+        sb.append("Backend report          ").append(profile["backend"] ?: currentBackend().name).append('\n')
+        sb.append("Requested backend       ").append(profile["requested_backend"] ?: currentBackend().name).append('\n')
+        sb.append("Active backend          ").append(profile["active_backend"] ?: currentBackend().name).append('\n')
+        sb.append("Fallback reason         ").append(profile["accelerator_fallback"] ?: "none").append('\n')
         sb.append("CPU threads              ").append(profile["threads"] ?: currentThreads())
         return sb.toString()
     }
@@ -684,5 +1132,5 @@ class MainActivity : AppCompatActivity() {
             ascii("RIFF"); int32(36 + pcm16.size); ascii("WAVE"); ascii("fmt "); int32(16); int16(1); int16(channels); int32(sampleRate); int32(byteRate); int16(blockAlign); int16(16); ascii("data"); int32(pcm16.size); out.write(pcm16)
         }
     }
-    override fun onDestroy() { stopAll(); synthesizer?.close(); synthesizer = null; scope.cancel(); super.onDestroy() }
+    override fun onDestroy() { benchmarkJob?.cancel(); stopAll(); synthesizer?.close(); synthesizer = null; scope.cancel(); super.onDestroy() }
 }

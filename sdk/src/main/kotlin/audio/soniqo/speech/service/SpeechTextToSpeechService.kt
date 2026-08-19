@@ -12,6 +12,7 @@ import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
 import android.util.Log
 import audio.soniqo.speech.ModelManager
+import audio.soniqo.speech.InferenceBackend
 import audio.soniqo.speech.SpeechSynthesizer
 import audio.soniqo.speech.SpeechSynthesizerConfig
 import audio.soniqo.speech.TtsSettings
@@ -35,6 +36,7 @@ class SpeechTextToSpeechService : TextToSpeechService() {
     @Volatile private var loadedLang3 = "eng"
     @Volatile private var loadedCountry3 = "USA"
     @Volatile private var loadedThreads = 0
+    @Volatile private var loadedBackend = InferenceBackend.CPU_XNNPACK
 
     override fun onCreate() {
         super.onCreate()
@@ -84,12 +86,18 @@ class SpeechTextToSpeechService : TextToSpeechService() {
     override fun onGetVoices(): MutableList<Voice> {
         val result = mutableListOf<Voice>()
         for (id in builtinVoiceIds()) {
-            result += Voice(voiceNameForId(id), Locale.ROOT, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false,
-                setOf(TextToSpeech.Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS))
+            // networkConnectionRequired=false is the API 21+ way to expose an
+            // offline voice. KEY_FEATURE_EMBEDDED_SYNTHESIS is deprecated.
+            result += Voice(
+                voiceNameForId(id), Locale.ROOT, Voice.QUALITY_NORMAL,
+                Voice.LATENCY_NORMAL, false, emptySet(),
+            )
         }
         for (id in customVoiceIds()) {
-            result += Voice(voiceNameForId(id), Locale.ROOT, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false,
-                setOf(TextToSpeech.Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS))
+            result += Voice(
+                voiceNameForId(id), Locale.ROOT, Voice.QUALITY_NORMAL,
+                Voice.LATENCY_NORMAL, false, emptySet(),
+            )
         }
         return result
     }
@@ -141,6 +149,7 @@ class SpeechTextToSpeechService : TextToSpeechService() {
                 selectedVoice = configuredVoice
                 val configuredSteps = TtsSettings.steps(applicationContext).coerceIn(1, 64)
                 val configuredThreads = TtsSettings.threads(applicationContext).coerceIn(1, 64)
+                val configuredBackend = TtsSettings.backend(applicationContext)
                 val configuredChunkCap = TtsSettings.chunkCap(applicationContext)
                 val configuredPregen = TtsSettings.preGeneration(applicationContext)
                 val configuredPregenQueue = TtsSettings.preGenerationQueue(applicationContext)
@@ -151,17 +160,17 @@ class SpeechTextToSpeechService : TextToSpeechService() {
                 val configuredSpeed = TtsSettings.speed(applicationContext).coerceIn(0.25f, 3.0f)
                 val effectiveSpeed = (configuredSpeed * requestRate).coerceIn(0.25f, 3.0f)
 
-                if (loadedThreads != configuredThreads) {
+                if (loadedThreads != configuredThreads || loadedBackend != configuredBackend) {
                     synchronized(lock) { synthesizer?.close(); synthesizer = null }
                 }
-                var synth = getOrCreateSynthesizer(configuredVoice, configuredSteps, configuredThreads)
+                var synth = getOrCreateSynthesizer(configuredVoice, configuredSteps, configuredThreads, configuredBackend)
                 try {
                     synth.setVoice(configuredVoice)
                 } catch (_: Throwable) {
                     // A custom voice may have been imported after this service instance created
                     // its native voice table. Recreate once so the new JSON is loaded.
                     synchronized(lock) { synthesizer?.close(); synthesizer = null }
-                    synth = getOrCreateSynthesizer(configuredVoice, configuredSteps, configuredThreads)
+                    synth = getOrCreateSynthesizer(configuredVoice, configuredSteps, configuredThreads, configuredBackend)
                     synth.setVoice(configuredVoice)
                 }
                 synth.setSpeed(1.0f)
@@ -172,7 +181,7 @@ class SpeechTextToSpeechService : TextToSpeechService() {
                 synth.setChunkGap(configuredGapMin, configuredGapMax)
                 synth.setTrailingSilenceTrimMs(configuredTrailingTrim)
 
-                Log.i(TAG, "SYNTH_APPLIED voice=$configuredVoice speed=$effectiveSpeed steps=$configuredSteps chunk=$configuredChunkCap pregen=$configuredPregen queue=$configuredPregenQueue gap=$configuredGapMin-$configuredGapMax trailingTrim=$configuredTrailingTrim lang=$language requestVoice=${request.voiceName} requestRate=$requestRate rules=${PronunciationRules.count(applicationContext)}")
+                Log.i(TAG, "SYNTH_APPLIED backend=$configuredBackend voice=$configuredVoice speed=$effectiveSpeed steps=$configuredSteps chunk=$configuredChunkCap pregen=$configuredPregen queue=$configuredPregenQueue gap=$configuredGapMin-$configuredGapMax trailingTrim=$configuredTrailingTrim lang=$language requestVoice=${request.voiceName} requestRate=$requestRate rules=${PronunciationRules.count(applicationContext)}")
 
                 // The model always synthesizes at 1x. At the common 1.00x setting we use
                 // the native chunk callback so Android receives the first audio as soon as
@@ -255,7 +264,7 @@ class SpeechTextToSpeechService : TextToSpeechService() {
         super.onDestroy()
     }
 
-    private fun getOrCreateSynthesizer(voiceId: String, totalSteps: Int, numThreads: Int): SpeechSynthesizer {
+    private fun getOrCreateSynthesizer(voiceId: String, totalSteps: Int, numThreads: Int, backend: InferenceBackend): SpeechSynthesizer {
         synchronized(lock) { synthesizer?.let { return it } }
         val modelDir = runBlocking { ModelManager.ensureTtsModels(applicationContext) }
         return synchronized(lock) {
@@ -263,6 +272,7 @@ class SpeechTextToSpeechService : TextToSpeechService() {
                 SpeechSynthesizerConfig(
                     modelDir = modelDir,
                     useNnapi = false,
+                    backend = backend,
                     voiceId = voiceId,
                     speed = 1.0f,
                     totalSteps = totalSteps,
@@ -272,8 +282,10 @@ class SpeechTextToSpeechService : TextToSpeechService() {
                     chunkGapMinMs = TtsSettings.chunkGapMinMs(applicationContext),
                     chunkGapMaxMs = TtsSettings.chunkGapMaxMs(applicationContext),
                     trailingSilenceTrimMs = TtsSettings.trailingSilenceTrimMs(applicationContext),
+                    nativeLibraryDir = applicationInfo.nativeLibraryDir,
+                    acceleratorCacheDir = File(cacheDir, "accelerator_cache").apply { mkdirs() }.absolutePath,
                 )
-            ).also { loadedThreads = numThreads; synthesizer = it }
+            ).also { loadedThreads = numThreads; loadedBackend = backend; synthesizer = it }
         }
     }
 

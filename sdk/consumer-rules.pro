@@ -16,3 +16,6 @@
 -keep class audio.soniqo.speech.ModelPrecision { *; }
 -keep class audio.soniqo.speech.PipelineState { *; }
 -keep class audio.soniqo.speech.service.SpeechTextToSpeechService { *; }
+
+# Qualcomm QNN delegate creates native-backed classes/reflection entry points.
+-keep class com.qualcomm.qti.** { *; }

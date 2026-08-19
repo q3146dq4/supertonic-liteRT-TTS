@@ -464,9 +464,9 @@ if(SPEECH_CORE_WITH_LITERT)
         # Kokoro staged 60-frame FP32 wrapper benchmark. Unlike the desktop-only
         # example CLIs above, this target also cross-compiles for physical Android
         # release measurements.
-        add_executable(speech_kokoro_litert_bench examples/litert/kokoro_tts_bench.cpp)
+        add_executable(speech_kokoro_litert_bench EXCLUDE_FROM_ALL examples/litert/kokoro_tts_bench.cpp)
         target_link_libraries(speech_kokoro_litert_bench PRIVATE speech_core_models_litert)
-        add_executable(speech_litert_tensor_bench examples/litert/tensor_bench.cpp)
+        add_executable(speech_litert_tensor_bench EXCLUDE_FROM_ALL examples/litert/tensor_bench.cpp)
         target_include_directories(speech_litert_tensor_bench PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/models/litert)
         target_link_libraries(speech_litert_tensor_bench PRIVATE litert)

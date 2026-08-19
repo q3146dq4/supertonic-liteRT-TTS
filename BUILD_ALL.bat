@@ -3,6 +3,12 @@ setlocal EnableExtensions
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
+call VERIFY_SOURCE_TREE.bat
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
 echo === 1/2: preparing native runtimes ===
 
 set "BASH_EXE="

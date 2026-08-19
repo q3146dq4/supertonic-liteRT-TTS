@@ -1,7 +1,8 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-set "JAVA17_HOME=%~dp0.tools\jdk17"
+set "JAVA17_HOME=%LOCALAPPDATA%\SupertonicTTS\jdk17"
+if not exist "%JAVA17_HOME%\bin\java.exe" set "JAVA17_HOME=%~dp0.tools\jdk17"
 if exist "%JAVA17_HOME%\bin\java.exe" goto :use_local
 if defined JAVA_HOME if exist "%JAVA_HOME%\bin\java.exe" goto :use_existing
 if exist "%ProgramFiles%\Android\Android Studio\jbr\bin\java.exe" set "JAVA_HOME=%ProgramFiles%\Android\Android Studio\jbr"

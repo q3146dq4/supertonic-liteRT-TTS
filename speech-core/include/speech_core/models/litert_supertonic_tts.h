@@ -13,13 +13,41 @@
 #include <unordered_map>
 #include <vector>
 
+
 namespace speech_core {
+
+class SupertonicExternalRunner {
+public:
+    virtual ~SupertonicExternalRunner() = default;
+    virtual bool supports_duration() const = 0;
+    virtual bool supports_encoder() const = 0;
+    virtual bool supports_vector() const = 0;
+    virtual bool supports_vocoder() const = 0;
+    virtual std::string backend_report() const = 0;
+    virtual void run_duration(const int64_t* text_ids, size_t text_ids_count,
+                              const float* style_dp, size_t style_dp_count,
+                              const float* text_mask, size_t text_mask_count,
+                              float* output) = 0;
+    virtual void run_encoder(const int64_t* text_ids, size_t text_ids_count,
+                             const float* style_ttl, size_t style_ttl_count,
+                             const float* text_mask, size_t text_mask_count,
+                             float* output, size_t output_count) = 0;
+    virtual void run_vector(float* noisy_latent, size_t noisy_latent_count,
+                            const float* text_emb, size_t text_emb_count,
+                            const float* style_ttl, size_t style_ttl_count,
+                            const float* latent_mask, size_t latent_mask_count,
+                            const float* text_mask, size_t text_mask_count,
+                            float current_step, float total_step) = 0;
+    virtual void run_vocoder(const float* latent, size_t latent_count,
+                             float* output, size_t output_count) = 0;
+};
 
 /// Supertonic-3 — 99M non-autoregressive flow-matching multilingual TTS via LiteRT.
 /// Android build uses the four Soniqo LiteRT graphs: duration predictor, text encoder,
 /// vector estimator, and vocoder. Output is 44.1 kHz and G2P-free.
 class LiteRTSupertonicTts : public TTSInterface {
 public:
+    enum class Backend { Cpu = 0, Gpu = 1, Npu = 2 };
     LiteRTSupertonicTts(const std::string& duration_path,
                         const std::string& text_encoder_path,
                         const std::string& vector_estimator_path,
@@ -27,7 +55,11 @@ public:
                         const std::string& tokenizer_dir,
                         const std::string& voice_styles_dir,
                         bool hw_accel = false,
-                        int num_threads = 4);
+                        int num_threads = 4,
+                        Backend backend = Backend::Cpu,
+                        std::string native_library_dir = {},
+                        std::string accelerator_cache_dir = {},
+                        std::shared_ptr<SupertonicExternalRunner> external_runner = {});
     ~LiteRTSupertonicTts() override;
 
     void synthesize(const std::string& text,
@@ -47,6 +79,8 @@ public:
     void set_chunk_gap_ms(int min_ms, int max_ms);
     void set_trailing_silence_trim_ms(int trim_ms);
     int num_threads() const { return num_threads_; }
+    Backend backend() const { return backend_; }
+    const std::string& backend_report() const { return backend_report_; }
     void set_speed(float speed) { speed_ = std::max(0.25f, std::min(3.0f, speed)); }
     void set_seed(uint32_t seed) { seed_ = seed; }
     uint32_t seed_used() const { return seed_used_; }
@@ -68,6 +102,13 @@ private:
         double text_encoder_ms = 0.0;
         double vocoder_ms = 0.0;
         double tensor_copy_ms = 0.0;
+        double chunking_ms = 0.0;
+        double token_process_ms = 0.0;
+        double latent_setup_ms = 0.0;
+        double append_ms = 0.0;
+        double stream_emit_ms = 0.0;
+        double pregen_cleanup_ms = 0.0;
+        double final_postprocess_ms = 0.0;
         double total_ms = 0.0;
         int chunk_count = 0;
         int truncated_chunks = 0;
@@ -89,6 +130,13 @@ private:
             text_encoder_ms = 0.0;
             vocoder_ms = 0.0;
             tensor_copy_ms = 0.0;
+            chunking_ms = 0.0;
+            token_process_ms = 0.0;
+            latent_setup_ms = 0.0;
+            append_ms = 0.0;
+            stream_emit_ms = 0.0;
+            pregen_cleanup_ms = 0.0;
+            final_postprocess_ms = 0.0;
             total_ms = 0.0;
             chunk_count = 0;
             truncated_chunks = 0;
@@ -131,6 +179,11 @@ private:
 
     int total_step_ = 4;
     int num_threads_ = 4;
+    Backend backend_ = Backend::Cpu;
+    std::string backend_report_ = "CPU/XNNPACK";
+    std::string native_library_dir_;
+    std::string accelerator_cache_dir_;
+    std::shared_ptr<SupertonicExternalRunner> external_runner_;
     int chunk_cap_ = 64;
     float speed_ = 1.0f;
     uint32_t seed_ = 0;

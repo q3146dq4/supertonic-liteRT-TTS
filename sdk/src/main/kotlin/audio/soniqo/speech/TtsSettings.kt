@@ -8,7 +8,10 @@ object TtsSettings {
     private const val KEY_SPEED = "speed"
     private const val KEY_STEPS = "steps"
     private const val KEY_ALLOW_NA = "allow_na"
+    private const val KEY_TEST_LANGUAGE = "test_language"
     private const val KEY_THREADS = "threads"
+    private const val KEY_BACKEND = "backend"
+    private const val KEY_CPU_DEFAULT_MIGRATION = "cpu_default_backend_migration_20260818_delegate_v3"
     private const val KEY_CHUNK_MODE = "chunk_mode"
     private const val KEY_CHUNK_CAP = "chunk_cap"
     private const val KEY_PREGEN = "pre_generation"
@@ -36,7 +39,28 @@ object TtsSettings {
     fun speed(context: Context): Float = prefs(context).getFloat(KEY_SPEED, 1.0f)
     fun steps(context: Context): Int = prefs(context).getInt(KEY_STEPS, 4)
     fun allowNa(context: Context): Boolean = prefs(context).getBoolean(KEY_ALLOW_NA, false)
+    fun testLanguage(context: Context): String = prefs(context).getString(KEY_TEST_LANGUAGE, "na") ?: "na"
     fun threads(context: Context): Int = prefs(context).getInt(KEY_THREADS, 4)
+    fun backend(context: Context): InferenceBackend {
+        val p = prefs(context)
+        // Earlier acceleration test builds could leave GPU/NPU persisted across APK updates.
+        // Migrate exactly once to the safe CPU/XNNPACK default. After this one-time migration,
+        // whatever backend the user explicitly selects is persisted normally.
+        if (!p.getBoolean(KEY_CPU_DEFAULT_MIGRATION, false)) {
+            check(p.edit()
+                .putString(KEY_BACKEND, InferenceBackend.CPU_XNNPACK.name)
+                .putBoolean(KEY_CPU_DEFAULT_MIGRATION, true)
+                .commit()) { "Failed to migrate Supertonic backend default to CPU/XNNPACK" }
+            return InferenceBackend.CPU_XNNPACK
+        }
+        val restored = runCatching {
+            InferenceBackend.valueOf(
+                p.getString(KEY_BACKEND, InferenceBackend.CPU_XNNPACK.name)
+                    ?: InferenceBackend.CPU_XNNPACK.name
+            )
+        }.getOrDefault(InferenceBackend.CPU_XNNPACK)
+        return restored
+    }
     fun chunkMode(context: Context): String = prefs(context).getString(KEY_CHUNK_MODE, CHUNK_BALANCED) ?: CHUNK_BALANCED
     fun manualChunkCap(context: Context): Int = prefs(context).getInt(KEY_CHUNK_CAP, 64).coerceIn(MIN_CHUNK_CAP, MAX_CHUNK_CAP)
     fun preGeneration(context: Context): Boolean = prefs(context).getBoolean(KEY_PREGEN, false)
@@ -60,6 +84,7 @@ object TtsSettings {
         threads: Int = threads(context),
         chunkMode: String = chunkMode(context),
         manualChunkCap: Int = manualChunkCap(context),
+        backend: InferenceBackend = backend(context),
     ) {
         // System TTS can be invoked immediately after leaving this app. Commit synchronously
         // so the TextToSpeechService sees the new settings without a disk-write race.
@@ -68,11 +93,22 @@ object TtsSettings {
             .putFloat(KEY_SPEED, speed)
             .putInt(KEY_STEPS, steps)
             .putInt(KEY_THREADS, threads.coerceIn(1, 64))
+            .putString(KEY_BACKEND, backend.name)
             .putString(KEY_CHUNK_MODE, normalizeChunkMode(chunkMode))
             .putInt(KEY_CHUNK_CAP, manualChunkCap.coerceIn(MIN_CHUNK_CAP, MAX_CHUNK_CAP))
             .putBoolean(KEY_PREGEN, prefs(context).getBoolean(KEY_PREGEN, false))
             .putBoolean(KEY_ALLOW_NA, prefs(context).getBoolean(KEY_ALLOW_NA, false))
             .commit()) { "Failed to persist Supertonic TTS settings" }
+    }
+
+
+    fun setBackend(context: Context, backend: InferenceBackend) {
+        check(prefs(context).edit()
+            .putString(KEY_BACKEND, backend.name)
+            .putBoolean(KEY_CPU_DEFAULT_MIGRATION, true)
+            .commit()) {
+            "Failed to persist Supertonic backend setting"
+        }
     }
 
     fun setChunkSettings(context: Context, mode: String, manualCap: Int) {
@@ -103,6 +139,13 @@ object TtsSettings {
     fun setAllowNa(context: Context, enabled: Boolean) {
         check(prefs(context).edit().putBoolean(KEY_ALLOW_NA, enabled).commit()) {
             "Failed to persist Supertonic mixed-language setting"
+        }
+    }
+
+    fun setTestLanguage(context: Context, language: String) {
+        val normalized = language.lowercase().ifBlank { "na" }
+        check(prefs(context).edit().putString(KEY_TEST_LANGUAGE, normalized).commit()) {
+            "Failed to persist Supertonic test language"
         }
     }
 

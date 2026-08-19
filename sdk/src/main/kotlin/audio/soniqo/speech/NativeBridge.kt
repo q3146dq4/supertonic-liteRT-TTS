@@ -6,12 +6,16 @@ internal object NativeBridge {
     external fun nativeCreateSynthesizer(
         modelDir: String,
         useNnapi: Boolean,
+        backend: Int,
         ttsModel: Int,
         voiceId: String,
         totalSteps: Int,
         speed: Float,
         numThreads: Int,
         chunkCap: Int,
+        nativeLibraryDir: String,
+        acceleratorCacheDir: String,
+        acceleratorRunner: DelegateSupertonicRunner?,
     ): Long
     external fun nativeDestroySynthesizer(handle: Long)
     external fun nativeStopSynthesizer(handle: Long)

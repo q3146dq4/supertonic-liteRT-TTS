@@ -1,0 +1,11 @@
+Build fix 2026-08-17
+
+1. Added com.google.ai.edge.litert:litert:2.1.0 to sdk dependencies.
+   Qualcomm qnn-litert-delegate 2.49.0 contains QnnDelegate but its Maven POM
+   does not declare the base LiteRT Java API dependency. QnnDelegate implements
+   org.tensorflow.lite.Delegate, so the base LiteRT Java API must be present.
+
+2. BUILD_ALL/build_apk now uses an installed JDK 17 and does not download a JDK.
+   This also removes the broken FINDSTR Java-version probe seen in the build log.
+
+3. LiteRT native/GPU runtime remains 2.1.6; QNN runtime/delegate remains 2.49.0.

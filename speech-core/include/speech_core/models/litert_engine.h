@@ -3,6 +3,7 @@
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_compiled_model.h"
 #include "litert/c/litert_environment.h"
+#include "litert/c/litert_environment_options.h"
 #include "litert/c/litert_layout.h"
 #include "litert/c/litert_model.h"
 #include "litert/c/litert_model_types.h"
@@ -45,8 +46,15 @@ namespace speech_core {
 
 inline void litert_check(LiteRtStatus status, const char* what) {
     if (status != kLiteRtStatusOk) {
-        throw std::runtime_error(std::string("LiteRT: ") + what
-                                 + " failed (status=" + std::to_string(status) + ")");
+        const char* status_text = LiteRtGetStatusString(status);
+        std::string message = std::string("LiteRT: ") + what
+            + " failed (status=" + std::to_string(status);
+        if (status_text && *status_text) {
+            message += ", ";
+            message += status_text;
+        }
+        message += ")";
+        throw std::runtime_error(message);
     }
 }
 
@@ -91,6 +99,22 @@ public:
                      "CreateManagedTensorBuffer");
         if (seed) write(seed, bytes);
     }
+    /// Allocate using the exact buffer requirements returned by CompiledModel.
+    /// Accelerator runtimes (notably Qualcomm HTP and Android GPU backends) may
+    /// require alignment or a non-host backing type. Using a generic HostMemory
+    /// buffer ignores that contract and can produce invalid accelerator results.
+    LiteRtHostBuffer(LiteRtEnvironment env,
+                     const LiteRtRankedTensorType& type,
+                     LiteRtTensorBufferRequirements requirements,
+                     const void* seed = nullptr) {
+        litert_check(LiteRtCreateManagedTensorBufferFromRequirements(
+                         env, &type, requirements, &buf_),
+                     "CreateManagedTensorBufferFromRequirements");
+        litert_check(LiteRtGetTensorBufferPackedSize(buf_, &bytes_),
+                     "GetTensorBufferPackedSize");
+        if (seed) write(seed, bytes_);
+    }
+
     ~LiteRtHostBuffer() { if (buf_) LiteRtDestroyTensorBuffer(buf_); }
 
     LiteRtHostBuffer(const LiteRtHostBuffer&)            = delete;
@@ -101,6 +125,7 @@ public:
 
     /// Copy `bytes` from `src` into this buffer's host memory.
     void write(const void* src, size_t bytes) {
+        if (bytes > bytes_) throw std::runtime_error("LiteRT TensorBuffer write exceeds packed size");
         void* p = nullptr;
         litert_check(LiteRtLockTensorBuffer(buf_, &p, kLiteRtTensorBufferLockModeWrite),
                      "LockTensorBuffer(write)");
@@ -110,6 +135,7 @@ public:
 
     /// Copy `bytes` from this buffer's host memory into `dst`.
     void read(void* dst, size_t bytes) const {
+        if (bytes > bytes_) throw std::runtime_error("LiteRT TensorBuffer read exceeds packed size");
         void* p = nullptr;
         litert_check(LiteRtLockTensorBuffer(buf_, &p, kLiteRtTensorBufferLockModeRead),
                      "LockTensorBuffer(read)");
@@ -139,9 +165,59 @@ public:
         return instance;
     }
 
+    /// Configure accelerator discovery before the first CompiledModel is created.
+    /// Android extracts the runtime/accelerator .so files into nativeLibraryDir.
+    /// LiteRT's CompiledModel API needs that directory explicitly in order to
+    /// discover out-of-tree accelerator libraries such as ClGl GPU.
+    void configure_android_accelerators(const std::string& native_library_dir,
+                                        const std::string& compiler_cache_dir) {
+        if (native_library_dir.empty()) return;
+        if (env_) {
+            // All app backends use the same extracted native library directory.
+            // Reconfiguration after environment creation is intentionally ignored.
+            return;
+        }
+        runtime_library_dir_ = native_library_dir;
+        compiler_plugin_library_dir_ = native_library_dir;
+        dispatch_library_dir_ = native_library_dir;
+        compiler_cache_dir_ = compiler_cache_dir;
+    }
+
     LiteRtEnvironment env() {
         if (!env_) {
-            litert_check(LiteRtCreateEnvironment(0, nullptr, &env_), "CreateEnvironment");
+            std::vector<LiteRtEnvOption> options;
+            auto add_string = [&](LiteRtEnvOptionTag tag, const std::string& value) {
+                if (value.empty()) return;
+                LiteRtEnvOption o{};
+                o.tag = tag;
+                o.value.type = kLiteRtAnyTypeString;
+                o.value.str_value = value.c_str();
+                options.push_back(o);
+            };
+            add_string(kLiteRtEnvOptionTagRuntimeLibraryDir, runtime_library_dir_);
+            add_string(kLiteRtEnvOptionTagCompilerPluginLibraryDir, compiler_plugin_library_dir_);
+            add_string(kLiteRtEnvOptionTagDispatchLibraryDir, dispatch_library_dir_);
+            add_string(kLiteRtEnvOptionTagCompilerCacheDir, compiler_cache_dir_);
+
+            // Register all Android accelerators needed by this app. Accelerator
+            // selection itself remains strict in load(): GPU requests GPU only,
+            // Qualcomm NPU requests NPU only, and no CPU/GPU fallback bit is set.
+            // The runtime/compiler/dispatch search paths above point at the APK's
+            // nativeLibraryDir, where the ClGl accelerator and Qualcomm QAIRT
+            // runtime libraries are packaged.
+            LiteRtEnvOption accel{};
+            accel.tag = kLiteRtEnvOptionTagAutoRegisterAccelerators;
+            accel.value.type = kLiteRtAnyTypeInt;
+            accel.value.int_value = static_cast<int64_t>(
+                kLiteRtHwAcceleratorCpu | kLiteRtHwAcceleratorGpu | kLiteRtHwAcceleratorNpu);
+            options.push_back(accel);
+
+            litert_check(LiteRtCreateEnvironment(static_cast<int>(options.size()),
+                                                  options.data(), &env_),
+                         "CreateEnvironment");
+            LOGI("LiteRT environment: native libs=%s cache=%s",
+                 runtime_library_dir_.empty() ? "<default>" : runtime_library_dir_.c_str(),
+                 compiler_cache_dir_.empty() ? "<none>" : compiler_cache_dir_.c_str());
         }
         return env_;
     }
@@ -151,9 +227,20 @@ public:
     /// `out_model` and `out_compiled` are caller-owned. Free in reverse order:
     /// `LiteRtDestroyCompiledModel(compiled)` first, then `LiteRtDestroyModel(model)`.
     void load(const std::string& path,
-              bool /*hw_accel*/,
+              bool hw_accel,
               LiteRtModel* out_model,
               LiteRtCompiledModel* out_compiled) {
+        load(path, hw_accel ? kLiteRtHwAcceleratorGpu : kLiteRtHwAcceleratorCpu, out_model, out_compiled);
+    }
+
+    /// Load a `.tflite` and compile it for an explicit accelerator.
+    /// CPU is always available. GPU/NPU require the corresponding Android
+    /// accelerator/runtime libraries to be packaged with the app/device.
+    void load(const std::string& path,
+              LiteRtHwAccelerators accelerator,
+              LiteRtModel* out_model,
+              LiteRtCompiledModel* out_compiled,
+              bool allow_cpu_fallback = false) {
         LOGI("Loading LiteRT model: %s",
              path.substr(path.find_last_of('/') + 1).c_str());
 
@@ -199,13 +286,18 @@ public:
             litert_check(LiteRtCreateModelFromFile(path.c_str(), &m), "CreateModelFromFile");
         }
 
-        // Build compile options with the CPU accelerator. LiteRT rejects a
-        // NULL options pointer (kLiteRtStatusErrorInvalidArgument). GPU/NPU
-        // delegates aren't shipped with the desktop wheel — CPU is what every
-        // platform consistently has.
+        // Build compile options for the requested accelerator. LiteRT rejects
+        // a NULL options pointer (kLiteRtStatusErrorInvalidArgument). Android
+        // builds may package GPU and vendor NPU runtimes; callers handle a
+        // failed accelerator compile and may fall back to CPU.
         LiteRtOptions opts = nullptr;
         litert_check(LiteRtCreateOptions(&opts), "CreateOptions");
-        LiteRtStatus s = LiteRtSetOptionsHardwareAccelerators(opts, kLiteRtHwAcceleratorCpu);
+        LiteRtHwAccelerators requested = accelerator;
+        if (allow_cpu_fallback && accelerator != kLiteRtHwAcceleratorCpu) {
+            requested = static_cast<LiteRtHwAccelerators>(
+                static_cast<int>(accelerator) | static_cast<int>(kLiteRtHwAcceleratorCpu));
+        }
+        LiteRtStatus s = LiteRtSetOptionsHardwareAccelerators(opts, requested);
         if (s != kLiteRtStatusOk) {
             LiteRtDestroyOptions(opts);
             LiteRtDestroyModel(m);
@@ -246,6 +338,10 @@ private:
     LiteRTEngine& operator=(const LiteRTEngine&) = delete;
 
     LiteRtEnvironment env_ = nullptr;
+    std::string runtime_library_dir_;
+    std::string compiler_plugin_library_dir_;
+    std::string dispatch_library_dir_;
+    std::string compiler_cache_dir_;
     // Backing storage for models loaded via LiteRtCreateModelFromBuffer,
     // keyed by file path. LiteRT retains a zero-copy pointer into each
     // buffer for the model's lifetime, so buffers must outlive any models

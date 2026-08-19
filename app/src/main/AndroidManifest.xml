@@ -17,8 +17,16 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SupertonicTTS">
 
+        <!-- Optional GPU driver libraries. required=false keeps CPU-only devices compatible. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL-car.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false" />
+        <uses-native-library android:name="libvndksupport.so" android:required="false" />
+        <!-- Optional Qualcomm Hexagon CDSP transport for the experimental HTP probe. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
         <activity
             android:name=".MainActivity"
+            android:icon="@mipmap/ic_launcher"
             android:exported="true"
             android:label="@string/app_name">
             <intent-filter>
@@ -77,6 +85,7 @@
 
         <service
             android:name="audio.soniqo.speech.service.SpeechTextToSpeechService"
+            android:icon="@mipmap/ic_launcher"
             android:enabled="true"
             android:exported="true"
             android:label="@string/app_name">

@@ -3,14 +3,26 @@ package com.supertonic.tts
 import android.app.Activity
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import audio.soniqo.speech.ModelManager
 
 class CheckVoiceDataActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val ready = ModelManager.areTtsModelsReady(applicationContext)
         val result = intent
-            .putStringArrayListExtra(TextToSpeech.Engine.EXTRA_AVAILABLE_VOICES, ArrayList(AVAILABLE_VOICES))
-            .putStringArrayListExtra(TextToSpeech.Engine.EXTRA_UNAVAILABLE_VOICES, ArrayList())
-        setResult(TextToSpeech.Engine.CHECK_VOICE_DATA_PASS, result)
+            .putStringArrayListExtra(
+                TextToSpeech.Engine.EXTRA_AVAILABLE_VOICES,
+                ArrayList(if (ready) AVAILABLE_VOICES else emptyList()),
+            )
+            .putStringArrayListExtra(
+                TextToSpeech.Engine.EXTRA_UNAVAILABLE_VOICES,
+                ArrayList(if (ready) emptyList() else AVAILABLE_VOICES),
+            )
+        setResult(
+            if (ready) TextToSpeech.Engine.CHECK_VOICE_DATA_PASS
+            else TextToSpeech.Engine.CHECK_VOICE_DATA_FAIL,
+            result,
+        )
         finish()
     }
 
