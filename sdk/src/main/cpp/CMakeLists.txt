@@ -21,4 +21,5 @@ add_subdirectory(${SPEECH_CORE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/speech_core)
 
 add_library(speech_android SHARED jni_bridge.cpp)
 target_compile_definitions(speech_android PRIVATE SPEECH_ANDROID_WITH_LITERT)
+target_compile_options(speech_android PRIVATE -O2)
 target_link_libraries(speech_android PRIVATE speech_core_models_litert android log)

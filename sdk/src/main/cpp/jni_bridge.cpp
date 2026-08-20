@@ -259,7 +259,7 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
         throw_runtime(env, "Only Supertonic is supported by this TTS engine");
         return 0;
     }
-    if (backend < 0 || backend > 2) {
+    if (backend < 0 || backend > 3) {
         throw_runtime(env, "Unknown Supertonic inference backend");
         return 0;
     }
@@ -268,7 +268,7 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
     const std::string native_lib_dir = to_string(env, nativeLibraryDir);
     const std::string accel_cache_dir = to_string(env, acceleratorCacheDir);
     std::shared_ptr<speech_core::SupertonicExternalRunner> external_runner;
-    if (backend != 0) {
+    if (backend == 1 || backend == 2) {
         try {
             external_runner = std::make_shared<JniSupertonicRunner>(env, acceleratorRunner);
         } catch (const std::exception& e) {
@@ -285,6 +285,7 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
         speech_core::LiteRTSupertonicTts::Backend native_backend = speech_core::LiteRTSupertonicTts::Backend::Cpu;
         if (backend == 1) native_backend = speech_core::LiteRTSupertonicTts::Backend::Gpu;
         else if (backend == 2) native_backend = speech_core::LiteRTSupertonicTts::Backend::Npu;
+        else if (backend == 3) native_backend = speech_core::LiteRTSupertonicTts::Backend::CpuFp16;
         handle->tts = std::make_unique<speech_core::LiteRTSupertonicTts>(
             dir + "/duration_predictor.tflite",
             dir + "/text_encoder.tflite",

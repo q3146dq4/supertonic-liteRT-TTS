@@ -102,6 +102,12 @@ else()
     )
 endif()
 
+if(ANDROID)
+    # GitHub Actions currently assembles a debug APK. Keep native inference
+    # orchestration optimized without enabling unsafe fast-math semantics.
+    target_compile_options(speech_core PRIVATE -O2)
+endif()
+
 # Build with -fPIC so the static library can be linked into shared libraries
 # (the Linux examples libspeech.so, the Android JNI .so, etc.). Apple's linker
 # doesn't require this; GNU ld does, and complains with "relocation R_X86_64_*
@@ -383,6 +389,12 @@ if(SPEECH_CORE_WITH_LITERT)
             -Wall -Wextra
             $<$<CONFIG:Release>:-O2>
         )
+    endif()
+
+    if(ANDROID)
+        # Match the Release target's conservative optimization level even when
+        # the Android wrapper is packaged as assembleDebug by CI.
+        target_compile_options(speech_core_models_litert PRIVATE -O2)
     endif()
 
     set_target_properties(speech_core_models_litert PROPERTIES POSITION_INDEPENDENT_CODE ON)

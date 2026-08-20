@@ -262,13 +262,14 @@ class DelegateSupertonicRunner(
     }
 
     init {
-        require(config.backend != InferenceBackend.CPU_XNNPACK)
+        require(!config.backend.isNativeCpu)
         callOnRunner {
             val kind = when (config.backend) {
                 InferenceBackend.QUALCOMM_NPU -> Kind.QNN_NPU
                 InferenceBackend.GPU_LITERT -> if (isQualcommDevice()) Kind.QNN_GPU else Kind.LITERT_GPU
                 InferenceBackend.NNAPI_DEVICE -> Kind.NNAPI
-                InferenceBackend.CPU_XNNPACK -> error("CPU backend must not create an accelerator runner")
+                InferenceBackend.CPU_XNNPACK,
+                InferenceBackend.CPU_XNNPACK_FP16 -> error("CPU backend must not create an accelerator runner")
             }
             val made = ArrayList<GraphRunner>(4)
             val failures = ArrayList<String>()

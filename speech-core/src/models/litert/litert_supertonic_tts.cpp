@@ -16,6 +16,7 @@
 #include <limits>
 #include <random>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 #include <stdexcept>
 
@@ -197,6 +198,11 @@ int graph_latent_frames() {
     return 64;
 }
 
+bool is_cpu_backend(LiteRTSupertonicTts::Backend backend) {
+    return backend == LiteRTSupertonicTts::Backend::Cpu ||
+           backend == LiteRTSupertonicTts::Backend::CpuFp16;
+}
+
 std::vector<float> parse_float_array(const std::string& s, size_t& i) {
     std::vector<float> out;
     json::skip_ws(s, i);
@@ -306,6 +312,12 @@ struct Graph {
     bool owns_delegate = false;
     TfLiteInterpreter* interpreter = nullptr;
 
+    // Fixed-shape CPU graphs never resize tensors after AllocateTensors().
+    // Cache the hot named input/output tensor pointers after first resolution
+    // instead of scanning every tensor on every VE flow step.
+    std::unordered_map<std::string, TfLiteTensor*> cpu_named_inputs;
+    const TfLiteTensor* cpu_cached_output = nullptr;
+
     // Strict accelerator path: LiteRT CompiledModel. GPU and NPU are requested
     // WITHOUT CPU/GPU fallback and are accepted only if LiteRT reports that the
     // entire graph is accelerated. This deliberately forbids mixed execution.
@@ -335,6 +347,8 @@ struct Graph {
         input_names.clear();
         output_names.clear();
         signature = nullptr;
+        cpu_named_inputs.clear();
+        cpu_cached_output = nullptr;
         if (interpreter) { TfLiteInterpreterDelete(interpreter); interpreter = nullptr; }
         if (delegate && owns_delegate) TfLiteXNNPackDelegateDelete(delegate);
         delegate = nullptr;
@@ -344,7 +358,7 @@ struct Graph {
         if (accel_model) { LiteRtDestroyModel(accel_model); accel_model = nullptr; }
     }
 
-    bool uses_interpreter_primary() const { return backend == Backend::Cpu; }
+    bool uses_interpreter_primary() const { return is_cpu_backend(backend); }
 
     static size_t elem_size(LiteRtElementType t) {
         switch (t) {
@@ -510,7 +524,7 @@ struct Graph {
         model_path = path;
         cpu_threads = std::max(1, threads);
 
-        if (backend == Backend::Cpu) {
+        if (is_cpu_backend(backend)) {
             model = TfLiteModelCreateFromFile(path.c_str());
             if (!model) throw std::runtime_error("Supertonic[" + name + "]: failed to load model " + path);
             auto* options = TfLiteInterpreterOptionsCreate();
@@ -518,6 +532,9 @@ struct Graph {
             TfLiteInterpreterOptionsSetNumThreads(options, threads);
             auto xnn = TfLiteXNNPackDelegateOptionsDefault();
             xnn.num_threads = threads;
+            if (backend == Backend::CpuFp16) {
+                xnn.flags |= kTfLiteXNNPackDelegateFlagForceFp16;
+            }
             delegate = TfLiteXNNPackDelegateCreate(&xnn);
             owns_delegate = true;
             if (!delegate) {
@@ -531,7 +548,9 @@ struct Graph {
             if (TfLiteInterpreterAllocateTensors(interpreter) != kTfLiteOk)
                 throw std::runtime_error("Supertonic[" + name + "]: CPU AllocateTensors failed");
             fully_accelerated = true;
-            acceleration_detail = "CPU/XNNPACK";
+            acceleration_detail = backend == Backend::CpuFp16
+                ? "CPU/XNNPACK FP16 (Experimental)"
+                : "CPU/XNNPACK";
             return;
         }
 
@@ -647,7 +666,28 @@ struct Graph {
     void write_input_named(const char* semantic_name, std::initializer_list<int> cpu_shape,
                            const void* data, size_t bytes, int cpu_occurrence = 0) {
         if (uses_interpreter_primary()) {
-            write_input(cpu_shape, data, bytes, cpu_occurrence);
+            const std::string key = semantic_name ? semantic_name : "";
+            TfLiteTensor* target = nullptr;
+            const auto cached = cpu_named_inputs.find(key);
+            if (cached != cpu_named_inputs.end()) {
+                target = cached->second;
+            } else {
+                int seen = 0;
+                const int count = TfLiteInterpreterGetInputTensorCount(interpreter);
+                for (int i = 0; i < count; ++i) {
+                    auto* t = TfLiteInterpreterGetInputTensor(interpreter, i);
+                    if (!tensor_has_shape(t, cpu_shape)) continue;
+                    if (seen++ == cpu_occurrence) {
+                        target = t;
+                        break;
+                    }
+                }
+                if (!target) {
+                    throw std::runtime_error("Supertonic[" + name + "]: required CPU input tensor missing");
+                }
+                cpu_named_inputs.emplace(key, target);
+            }
+            tflite_check(TfLiteTensorCopyFromBuffer(target, data, bytes), "input copy");
             return;
         }
         const std::vector<int> expected_shape(cpu_shape);
@@ -683,15 +723,19 @@ struct Graph {
     void read_output(std::initializer_list<int> shape_il, void* data, size_t bytes, int occurrence = 0) {
         const std::vector<int> shape(shape_il);
         if (uses_interpreter_primary()) {
-            const TfLiteTensor* result = nullptr;
-            const int count = TfLiteInterpreterGetOutputTensorCount(interpreter);
-            int seen = 0;
-            for (int i = 0; i < count; ++i) {
-                const auto* t = TfLiteInterpreterGetOutputTensor(interpreter, i);
-                if (!tensor_has_shape_vec(t, shape)) continue;
-                if (seen++ == occurrence) { result = t; break; }
+            const TfLiteTensor* result = cpu_cached_output;
+            if (!result || !tensor_has_shape_vec(result, shape)) {
+                result = nullptr;
+                const int count = TfLiteInterpreterGetOutputTensorCount(interpreter);
+                int seen = 0;
+                for (int i = 0; i < count; ++i) {
+                    const auto* t = TfLiteInterpreterGetOutputTensor(interpreter, i);
+                    if (!tensor_has_shape_vec(t, shape)) continue;
+                    if (seen++ == occurrence) { result = t; break; }
+                }
+                if (!result) throw std::runtime_error("Supertonic[" + name + "]: required output tensor missing");
+                cpu_cached_output = result;
             }
-            if (!result) throw std::runtime_error("Supertonic[" + name + "]: required output tensor missing");
             if (TfLiteTensorCopyToBuffer(result, data, bytes) != kTfLiteOk)
                 throw std::runtime_error("Supertonic[" + name + "]: output copy failed");
             return;
@@ -722,6 +766,7 @@ struct Graph {
 
     std::string decision_label() const {
         if (backend == Backend::Cpu) return "CPU/XNNPACK";
+        if (backend == Backend::CpuFp16) return "CPU/XNNPACK FP16";
         return backend == Backend::Gpu ? "GPU(FULL)" : "NPU(FULL)";
     }
 };
@@ -811,15 +856,17 @@ LiteRTSupertonicTts::LiteRTSupertonicTts(
       voice_styles_dir_(voice_styles_dir) {
     (void)hw_accel;
 
-    if (backend_ == Backend::Cpu) {
-        // Keep the already-measured CPU/XNNPACK implementation completely
-        // untouched. Accelerator experiments never replace or wrap this path.
+    if (is_cpu_backend(backend_)) {
+        // Preserve the verified FP32 baseline and keep FP16 as a separate
+        // XNNPACK-only experiment using the same published FP32 model files.
         interp_ = std::make_unique<InterpreterState>();
-        interp_->duration.load(duration_path_, num_threads_, Backend::Cpu, "duration");
-        interp_->encoder.load(text_encoder_path_, num_threads_, Backend::Cpu, "encoder");
-        interp_->vector.load(vector_estimator_path_, num_threads_, Backend::Cpu, "vector_estimator");
-        interp_->vocoder.load(vocoder_path_, num_threads_, Backend::Cpu, "vocoder");
-        backend_report_ = "CPU/XNNPACK";
+        interp_->duration.load(duration_path_, num_threads_, backend_, "duration");
+        interp_->encoder.load(text_encoder_path_, num_threads_, backend_, "encoder");
+        interp_->vector.load(vector_estimator_path_, num_threads_, backend_, "vector_estimator");
+        interp_->vocoder.load(vocoder_path_, num_threads_, backend_, "vocoder");
+        backend_report_ = backend_ == Backend::CpuFp16
+            ? "CPU/XNNPACK FP16 (Experimental)"
+            : "CPU/XNNPACK";
     } else {
         if (!external_runner_) {
             throw std::runtime_error("Supertonic accelerator delegate runner was not supplied");
@@ -872,7 +919,7 @@ void LiteRTSupertonicTts::cancel() {
 void LiteRTSupertonicTts::set_pre_generation(bool enabled) {
     // Accelerator delegates are intentionally single-runner/single-thread. Do
     // not create duplicate 380 MB delegate engines for speculative pre-generation.
-    if (backend_ != Backend::Cpu) { pre_generation_ = false; return; }
+    if (!is_cpu_backend(backend_)) { pre_generation_ = false; return; }
     // Settings may be toggled while Android is still synthesizing. Do not destroy
     // in-flight pre-generation engines here; the next synthesis observes the new
     // flag safely after the current request finishes.
@@ -991,7 +1038,7 @@ void LiteRTSupertonicTts::synthesize(const std::string& text,
     };
 
     const int effective_pregen_depth = std::max(2, std::min(3, pre_generation_queue_));
-    if (backend_ == Backend::Cpu && pre_generation_ && on_chunk && chunks.size() > 1) {
+    if (is_cpu_backend(backend_) && pre_generation_ && on_chunk && chunks.size() > 1) {
         if (static_cast<int>(pregen_engines_.size()) != effective_pregen_depth) {
             for (auto& engine : pregen_engines_) if (engine) engine->cancel();
             pregen_engines_.clear();
@@ -1157,7 +1204,7 @@ void LiteRTSupertonicTts::synthesize(const std::string& text,
         })});
     };
 
-    if (backend_ == Backend::Cpu && pre_generation_ && on_chunk && chunks.size() > 1 && !pregen_engines_.empty()) {
+    if (is_cpu_backend(backend_) && pre_generation_ && on_chunk && chunks.size() > 1 && !pregen_engines_.empty()) {
         while (pending.size() < pregen_engines_.size() && next_chunk_to_launch < chunks.size()) {
             launch_one(next_chunk_to_launch++);
         }
@@ -1328,20 +1375,21 @@ std::string LiteRTSupertonicTts::performance_profile() const {
 std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
                                                      const std::string& language,
                                                      size_t chunk_index) {
-    if (backend_ == Backend::Cpu && !interp_)
+    if (is_cpu_backend(backend_) && !interp_)
         throw std::runtime_error("Supertonic: CPU interpreter state is not initialized");
-    if (backend_ != Backend::Cpu && !external_runner_)
+    if (!is_cpu_backend(backend_) && !external_runner_)
         throw std::runtime_error("Supertonic: accelerator delegate runner is not initialized");
     const VoiceStyle& voice = current_voice();
     const auto token_start = SteadyClock::now();
     const auto tok = tokenizer_->process(chunk, language, kTextT);
     profile_.token_process_ms += elapsed_ms(token_start, SteadyClock::now());
 
-    const std::vector<int64_t> ids64(tok.ids.begin(), tok.ids.end());
+    ids64_scratch_.assign(tok.ids.begin(), tok.ids.end());
+    const auto& ids64 = ids64_scratch_;
     float duration = 0.0f;
     {
         const auto t0 = SteadyClock::now();
-        if (backend_ == Backend::Cpu || !external_runner_->supports_duration()) {
+        if (is_cpu_backend(backend_) || !external_runner_->supports_duration()) {
             interp_->duration.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
             interp_->duration.write_input_named("text_ids", {1, kTextT}, ids64.data(), ids64.size() * sizeof(int64_t));
             interp_->duration.write_input_named("style_dp", {1, 8, 16}, voice.style_dp.data(), voice.style_dp.size() * sizeof(float));
@@ -1361,10 +1409,11 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     const double max_graph_duration_s = static_cast<double>(graph_latent_frames()) * kChunkSamples / kSampleRateConst;
     if (duration > max_graph_duration_s * 1.001) ++profile_.truncated_chunks;
 
-    std::vector<float> text_emb(static_cast<size_t>(256) * kTextT);
+    text_emb_scratch_.resize(static_cast<size_t>(256) * kTextT);
+    auto& text_emb = text_emb_scratch_;
     {
         const auto t0 = SteadyClock::now();
-        if (backend_ == Backend::Cpu || !external_runner_->supports_encoder()) {
+        if (is_cpu_backend(backend_) || !external_runner_->supports_encoder()) {
             interp_->encoder.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
             interp_->encoder.write_input_named("text_ids", {1, kTextT}, ids64.data(), ids64.size() * sizeof(int64_t));
             interp_->encoder.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
@@ -1386,13 +1435,15 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     const int l_true = std::max(1, static_cast<int>((wav_len + chunk_size - 1) / chunk_size));
     const int L = graph_latent_frames();
     const int L_fill = std::min(l_true, L);
-    std::vector<float> latent_mask(static_cast<size_t>(L), 0.0f);
+    latent_mask_scratch_.assign(static_cast<size_t>(L), 0.0f);
+    auto& latent_mask = latent_mask_scratch_;
     for (int t = 0; t < L_fill; ++t) latent_mask[t] = 1.0f;
 
     const auto latent_start = SteadyClock::now();
     std::mt19937 rng(seed_used_ + 0x9E3779B9u * static_cast<uint32_t>(chunk_index + 1));
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    std::vector<float> xt(static_cast<size_t>(kLatentChannels) * L);
+    latent_scratch_.resize(static_cast<size_t>(kLatentChannels) * L);
+    auto& xt = latent_scratch_;
     for (int c = 0; c < kLatentChannels; ++c)
         for (int t = 0; t < L; ++t) xt[static_cast<size_t>(c) * L + t] = nd(rng) * latent_mask[t];
     profile_.latent_setup_ms += elapsed_ms(latent_start, SteadyClock::now());
@@ -1400,18 +1451,27 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     const float total_step_f = static_cast<float>(total_step_);
     if (profile_.ve_step_ms.size() != static_cast<size_t>(total_step_))
         profile_.ve_step_ms.assign(static_cast<size_t>(total_step_), 0.0);
+
+    const bool vector_on_cpu =
+        is_cpu_backend(backend_) || !external_runner_->supports_vector();
+    if (vector_on_cpu) {
+        // These five tensors are invariant for every flow-matching step in the
+        // current chunk. TFLite input tensors retain their contents across
+        // Invoke(), so copy them once instead of total_steps times.
+        interp_->vector.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
+        interp_->vector.write_input_named("latent_mask", {1, 1, L}, latent_mask.data(), latent_mask.size() * sizeof(float));
+        interp_->vector.write_input_named("total_step", {1}, &total_step_f, sizeof(float), 1);
+        interp_->vector.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
+        interp_->vector.write_input_named("text_emb", {1, 256, kTextT}, text_emb.data(), text_emb.size() * sizeof(float));
+    }
+
     for (int step = 0; step < total_step_; ++step) {
         if (cancelled_.load()) return {};
         const auto t0 = SteadyClock::now();
         const float cur_step_f = static_cast<float>(step);
-        if (backend_ == Backend::Cpu || !external_runner_->supports_vector()) {
+        if (vector_on_cpu) {
             interp_->vector.write_input_named("current_step", {1}, &cur_step_f, sizeof(float), 0);
-            interp_->vector.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
-            interp_->vector.write_input_named("latent_mask", {1, 1, L}, latent_mask.data(), latent_mask.size() * sizeof(float));
             interp_->vector.write_input_named("noisy_latent", {1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
-            interp_->vector.write_input_named("total_step", {1}, &total_step_f, sizeof(float), 1);
-            interp_->vector.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
-            interp_->vector.write_input_named("text_emb", {1, 256, kTextT}, text_emb.data(), text_emb.size() * sizeof(float));
             interp_->vector.run("vector_estimator Run");
             interp_->vector.read_output({1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
         } else {
@@ -1430,7 +1490,7 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     std::vector<float> wav(static_cast<size_t>(chunk_size) * L);
     {
         const auto t0 = SteadyClock::now();
-        if (backend_ == Backend::Cpu || !external_runner_->supports_vocoder()) {
+        if (is_cpu_backend(backend_) || !external_runner_->supports_vocoder()) {
             interp_->vocoder.write_input_named("latent", {1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
             interp_->vocoder.run("vocoder Run");
             interp_->vocoder.read_output({1, chunk_size * L}, wav.data(), wav.size() * sizeof(float));

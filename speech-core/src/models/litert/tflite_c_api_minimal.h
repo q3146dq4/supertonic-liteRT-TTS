@@ -8,6 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 
+// TensorFlow Lite public XNNPACK delegate flag:
+// TFLITE_XNNPACK_DELEGATE_FLAG_FORCE_FP16 == 1 << 2.
+// Keep our private ABI header self-contained instead of importing the full
+// TensorFlow Lite header tree.
+inline constexpr std::uint32_t kTfLiteXNNPackDelegateFlagForceFp16 = 0x00000004u;
+
 #if defined(_WIN32)
 #define SPEECH_TFL_CAPI __declspec(dllimport)
 #else

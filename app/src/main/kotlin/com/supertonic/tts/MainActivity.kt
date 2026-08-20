@@ -74,9 +74,10 @@ class MainActivity : AppCompatActivity() {
     private val benchmarkThreadCounts = (1..8).toList()
     private val backends = listOf(
         "CPU / XNNPACK" to InferenceBackend.CPU_XNNPACK,
-        "GPU 실험적 / 자동 품질검사·CPU 복구" to InferenceBackend.GPU_LITERT,
-        "NNAPI 실험적 / 자동 품질검사·CPU 복구" to InferenceBackend.NNAPI_DEVICE,
-        "Qualcomm NPU/HTP 실험적 / Snapdragon 전용" to InferenceBackend.QUALCOMM_NPU,
+        "CPU / XNNPACK FP16 (Experimental)" to InferenceBackend.CPU_XNNPACK_FP16,
+        "GPU (Experimental) / 자동 품질검사·CPU 복구" to InferenceBackend.GPU_LITERT,
+        "NNAPI (Experimental) / 자동 품질검사·CPU 복구" to InferenceBackend.NNAPI_DEVICE,
+        "Qualcomm NPU/HTP (Experimental) / Snapdragon 전용" to InferenceBackend.QUALCOMM_NPU,
     )
     private val chunkModes = listOf(
         "보수적 · 짧게 (40)" to TtsSettings.CHUNK_CONSERVATIVE,
@@ -252,7 +253,7 @@ class MainActivity : AppCompatActivity() {
         backendSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, backends.map { it.first })
         root.addView(backendSpinner)
         root.addView(TextView(this).apply {
-            text = "기본 Backend는 CPU/XNNPACK입니다. RTF는 생성 시간÷음성 길이이며 낮을수록 빠릅니다. Snapdragon 8 Elite Gen 5 기기의 동일 설정 End-to-end RTF는 CPU 0.188, QNN GPU hybrid 0.260, NNAPI 1.936으로 CPU가 가장 빨랐습니다. 테스트한 Helio G99 기기에서는 GPU가 비유한 출력으로 실패했고, NNAPI는 RTF 2.148에 Audio peak 0.029 / RMS 0.002의 손상된 바람 소리를 냈습니다. 따라서 GPU·NNAPI·NPU는 모두 실험적입니다. 앱은 NaN/Inf뿐 아니라 비정상 저에너지/과대 출력을 검사하고, 첫 음성이 전달되기 전에 실패하면 같은 요청을 CPU로 한 번 자동 재실행합니다. NPU 선택은 삭제하지 않았지만 공개 FP32 모델의 HTP Encoder·VE는 차단하고 HTP Vocoder probe만 보존했습니다. 프로세스를 종료시킨 DSP VE 경로는 사용하지 않습니다."
+            text = "기본 Backend는 CPU/XNNPACK입니다. RTF는 생성 시간÷음성 길이이며 낮을수록 빠릅니다. Snapdragon 8 Elite Gen 5 기기의 동일 설정 End-to-end RTF는 CPU 0.188, QNN GPU hybrid 0.260, NNAPI 1.936으로 CPU가 가장 빨랐습니다. 테스트한 Helio G99 기기에서는 GPU가 비유한 출력으로 실패했고, NNAPI는 RTF 2.148에 Audio peak 0.029 / RMS 0.002의 손상된 바람 소리를 냈습니다. CPU/XNNPACK FP16은 동일 FP32 모델을 XNNPACK의 강제 FP16 연산 경로로 실행하는 실험 모드이며 실패 시 CPU/XNNPACK으로 복구합니다. GPU·NNAPI·NPU도 모두 실험적입니다. 앱은 NaN/Inf뿐 아니라 비정상 저에너지/과대 출력을 검사하고, 첫 음성이 전달되기 전에 실패하면 같은 요청을 CPU로 한 번 자동 재실행합니다. NPU 선택은 삭제하지 않았지만 공개 FP32 모델의 HTP Encoder·VE는 차단하고 HTP Vocoder probe만 보존했습니다. 프로세스를 종료시킨 DSP VE 경로는 사용하지 않습니다."
             textSize = 13f; setPadding(0, 0, 0, 8)
         })
 

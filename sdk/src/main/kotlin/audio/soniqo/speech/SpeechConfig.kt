@@ -6,13 +6,20 @@ enum class TtsModel(internal val nativeId: Int) { SUPERTONIC(1) }
 
 enum class InferenceBackend(internal val nativeId: Int) {
     CPU_XNNPACK(0),
+    // Same published FP32 .tflite files, but eligible XNNPACK FP32 operators
+    // are executed with the delegate's forced-FP16 path. Kept separate from
+    // the verified FP32 CPU baseline and automatically falls back to it.
+    CPU_XNNPACK_FP16(3),
     GPU_LITERT(1),
     // Explicitly experimental: unsafe Encoder/DSP-VE paths stay blocked. The
     // retained QNN HTP vocoder probe automatically retries on CPU when rejected.
     QUALCOMM_NPU(2),
     // Native C++ only distinguishes CPU from an externally-owned runner.
     // Reuse its accelerator id while DelegateSupertonicRunner selects NNAPI.
-    NNAPI_DEVICE(1),
+    NNAPI_DEVICE(1);
+
+    internal val isNativeCpu: Boolean
+        get() = this == CPU_XNNPACK || this == CPU_XNNPACK_FP16
 }
 
 data class SpeechSynthesizerConfig(
@@ -103,7 +110,7 @@ internal class SpeechSynthesizerImpl(
         var madeRunner: DelegateSupertonicRunner? = null
         var madeHandle = 0L
         try {
-            if (backend != InferenceBackend.CPU_XNNPACK) {
+            if (!backend.isNativeCpu) {
                 madeRunner = DelegateSupertonicRunner(config.copy(backend = backend))
             }
             madeHandle = NativeBridge.nativeCreateSynthesizer(

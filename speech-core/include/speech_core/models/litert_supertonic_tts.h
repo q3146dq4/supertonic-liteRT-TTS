@@ -47,7 +47,7 @@ public:
 /// vector estimator, and vocoder. Output is 44.1 kHz and G2P-free.
 class LiteRTSupertonicTts : public TTSInterface {
 public:
-    enum class Backend { Cpu = 0, Gpu = 1, Npu = 2 };
+    enum class Backend { Cpu = 0, Gpu = 1, Npu = 2, CpuFp16 = 3 };
     LiteRTSupertonicTts(const std::string& duration_path,
                         const std::string& text_encoder_path,
                         const std::string& vector_estimator_path,
@@ -203,6 +203,16 @@ private:
     std::string voice_styles_dir_;
     std::atomic<bool> cancelled_{false};
     PerformanceProfile profile_{};
+
+    // Fixed-shape scratch storage reused across sequential chunks. The engine
+    // is already stateful/non-reentrant (profile_, last_pcm_, cancellation),
+    // so reusing these buffers removes allocator churn without changing model
+    // inputs, output values, T=128, or L=64.
+    std::vector<int64_t> ids64_scratch_;
+    std::vector<float> text_emb_scratch_;
+    std::vector<float> latent_mask_scratch_;
+    std::vector<float> latent_scratch_;
+
     std::vector<float> last_pcm_;
 };
 
