@@ -344,7 +344,10 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
     speech_core::LiteRTEngine::get().configure_android_accelerators(
         native_lib_dir, accel_cache_dir);
     std::shared_ptr<speech_core::SupertonicExternalRunner> external_runner;
+    const bool native_soniqo_npu_jit =
+        ttsModel == TTS_SUPERTONIC && backend == 2 && acceleratorRunner == nullptr;
     if (!strict_full_fp16 &&
+        !native_soniqo_npu_jit &&
         (backend == 1 || backend == 2 || reza_hybrid)) {
         try {
             external_runner = std::make_shared<JniSupertonicRunner>(

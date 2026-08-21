@@ -587,6 +587,24 @@ struct Graph {
         return true;
     }
 
+    static double relative_rmse(const float* test, const float* reference, size_t n) {
+        if ((!test || !reference) && n) return std::numeric_limits<double>::infinity();
+        long double diff_sq = 0.0L;
+        long double ref_sq = 0.0L;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(test[i]) || !std::isfinite(reference[i]))
+                return std::numeric_limits<double>::infinity();
+            const long double d =
+                static_cast<long double>(test[i]) - static_cast<long double>(reference[i]);
+            const long double r = static_cast<long double>(reference[i]);
+            diff_sq += d * d;
+            ref_sq += r * r;
+        }
+        if (n == 0) return 0.0;
+        const long double denom = std::max(ref_sq, static_cast<long double>(1.0e-18L));
+        return static_cast<double>(std::sqrt(diff_sq / denom));
+    }
+
     void load(const std::string& path,
               int threads,
               Backend requested,
@@ -800,7 +818,20 @@ struct Graph {
         ins.reserve(input_buffers.size()); outs.reserve(output_buffers.size());
         for (auto& b : input_buffers) ins.push_back(b->raw());
         for (auto& b : output_buffers) outs.push_back(b->raw());
-        const auto status = LiteRtRunCompiledModel(compiled, 0, ins.size(), ins.data(), outs.size(), outs.data());
+        LOGI("Supertonic[%s] [RUN-BEGIN] %s backend=%s",
+             name.c_str(),
+             what ? what : "invoke",
+             backend == Backend::Npu ? "NPU" : "GPU");
+
+        const auto status = LiteRtRunCompiledModel(
+            compiled, 0, ins.size(), ins.data(), outs.size(), outs.data());
+
+        const char* run_status_text = LiteRtGetStatusString(status);
+        LOGI("Supertonic[%s] [RUN-END] status=%d (%s)",
+             name.c_str(),
+             static_cast<int>(status),
+             run_status_text ? run_status_text : "");
+
         if (status != kLiteRtStatusOk) {
             const char* status_text = LiteRtGetStatusString(status);
             throw std::runtime_error("Supertonic[" + name + "]: strict accelerator invoke failed (status=" +
@@ -844,6 +875,11 @@ struct Graph {
             auto* dst = static_cast<float*>(data);
             for (size_t i = 0; i < output_elements; ++i) {
                 dst[i] = half_to_float(fp16_output_scratch[i]);
+            }
+            if (name == "duration" && output_elements == 1) {
+                LOGI("[FP16-DURATION-RAW] bits=0x%04x decoded=%.9g",
+                     static_cast<unsigned int>(fp16_output_scratch[0]),
+                     static_cast<double>(dst[0]));
             }
         } else {
             const size_t expected = output_elements *
@@ -1020,6 +1056,38 @@ LiteRTSupertonicTts::LiteRTSupertonicTts(
         backend_report_ = backend_ == Backend::CpuFp16
             ? "CPU/XNNPACK FP16 (Experimental)"
             : "CPU/XNNPACK";
+    } else if (backend_ == Backend::Npu && !external_runner_) {
+        // NPU-VE-ONLY-v8.2
+        // Isolate the dominant Vector Estimator on native QNN HTP.
+        // DP is CPU because its NPU output was proven NaN/Inf on-device.
+        // Encoder/Vocoder stay CPU for this isolation test so their own QNN
+        // numerical behavior cannot hide whether VE acceleration is usable.
+        LOGI("Supertonic normal FP32: initializing VE-only native Qualcomm NPU/QNN JIT");
+
+        npu_cpu_fallback_ = std::make_unique<InterpreterState>();
+        npu_cpu_fallback_->duration.load(
+            duration_path_, num_threads_, Backend::Cpu, "duration_cpu");
+        npu_cpu_fallback_->encoder.load(
+            text_encoder_path_, num_threads_, Backend::Cpu, "encoder_cpu");
+        npu_cpu_fallback_->vector.load(
+            vector_estimator_path_, num_threads_, Backend::Cpu, "vector_estimator_cpu");
+        npu_cpu_fallback_->vocoder.load(
+            vocoder_path_, num_threads_, Backend::Cpu, "vocoder_cpu");
+
+        interp_ = std::make_unique<InterpreterState>();
+        npu_encoder_enabled_ = false;
+        npu_vector_enabled_ = false;
+        npu_vocoder_enabled_ = false;
+        npu_encoder_validated_ = false;
+        npu_vector_validated_ = false;
+        npu_vocoder_validated_ = false;
+
+        interp_->vector.load(
+            vector_estimator_path_, num_threads_, Backend::Npu, "vector_estimator");
+        npu_vector_enabled_ = true;
+
+        refresh_native_npu_report();
+        pre_generation_ = false;
     } else {
         if (!external_runner_) {
             throw std::runtime_error("Supertonic accelerator delegate runner was not supplied");
@@ -1061,7 +1129,18 @@ LiteRTSupertonicTts::LiteRTSupertonicTts(
 
 LiteRTSupertonicTts::~LiteRTSupertonicTts() = default;
 
-void LiteRTSupertonicTts::destroy_graphs() noexcept { interp_.reset(); }
+void LiteRTSupertonicTts::refresh_native_npu_report() {
+    if (backend_ != Backend::Npu || strict_full_fp16_ || external_runner_) return;
+    backend_report_ =
+        std::string("Soniqo FP32 / Qualcomm NPU VE-only (DP=CPU,Enc=CPU,VE=") +
+        (npu_vector_enabled_ ? "NPU" : "CPU") +
+        ",Voc=CPU)";
+}
+
+void LiteRTSupertonicTts::destroy_graphs() noexcept {
+    interp_.reset();
+    npu_cpu_fallback_.reset();
+}
 
 void LiteRTSupertonicTts::cancel() {
     cancelled_.store(true);
@@ -1543,10 +1622,25 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
                                                      const std::string& language,
                                                      size_t chunk_index) {
     if (reza_hybrid_) return synth_chunk_reza(chunk, language, chunk_index);
-    if (is_cpu_backend(backend_) && !interp_)
-        throw std::runtime_error("Supertonic: CPU interpreter state is not initialized");
-    if (!is_cpu_backend(backend_) && !external_runner_)
-        throw std::runtime_error("Supertonic: accelerator delegate runner is not initialized");
+
+    const bool normal_native_npu =
+        backend_ == Backend::Npu && !strict_full_fp16_ && !external_runner_;
+    const bool native_compiled_graphs = strict_full_fp16_;
+
+    if (normal_native_npu) {
+        if (!interp_ || !npu_cpu_fallback_)
+            throw std::runtime_error(
+                "Supertonic: adaptive native NPU graph state is not initialized");
+    } else if (native_compiled_graphs) {
+        if (!interp_)
+            throw std::runtime_error(
+                "Supertonic: native CompiledModel graph state is not initialized");
+    } else {
+        if (is_cpu_backend(backend_) && !interp_)
+            throw std::runtime_error("Supertonic: CPU interpreter state is not initialized");
+        if (!is_cpu_backend(backend_) && !external_runner_)
+            throw std::runtime_error("Supertonic: accelerator delegate runner is not initialized");
+    }
     const VoiceStyle& voice = current_voice();
     const auto token_start = SteadyClock::now();
     const auto tok = tokenizer_->process(chunk, language, kTextT);
@@ -1557,7 +1651,14 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     float duration = 0.0f;
     {
         const auto t0 = SteadyClock::now();
-        if (is_cpu_backend(backend_) || !external_runner_->supports_duration()) {
+        if (normal_native_npu) {
+            auto& g = npu_cpu_fallback_->duration;
+            g.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
+            g.write_input_named("text_ids", {1, kTextT}, ids64.data(), ids64.size() * sizeof(int64_t));
+            g.write_input_named("style_dp", {1, 8, 16}, voice.style_dp.data(), voice.style_dp.size() * sizeof(float));
+            g.run("duration CPU fallback Run");
+            g.read_output({1}, &duration, sizeof(float));
+        } else if (native_compiled_graphs || is_cpu_backend(backend_) || !external_runner_->supports_duration()) {
             interp_->duration.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
             interp_->duration.write_input_named("text_ids", {1, kTextT}, ids64.data(), ids64.size() * sizeof(int64_t));
             interp_->duration.write_input_named("style_dp", {1, 8, 16}, voice.style_dp.data(), voice.style_dp.size() * sizeof(float));
@@ -1575,13 +1676,27 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     }
 
     const double max_graph_duration_s = static_cast<double>(graph_latent_frames()) * kChunkSamples / kSampleRateConst;
+    LOGI("[DURATION-PROBE] strict=%d backend=%d text_bytes=%zu duration=%.9g max_window=%.9g overflow=%d",
+         strict_full_fp16_ ? 1 : 0,
+         static_cast<int>(backend_),
+         chunk.size(),
+         static_cast<double>(duration),
+         max_graph_duration_s,
+         duration > max_graph_duration_s * 1.001 ? 1 : 0);
     if (duration > max_graph_duration_s * 1.001) ++profile_.truncated_chunks;
 
     text_emb_scratch_.resize(static_cast<size_t>(256) * kTextT);
     auto& text_emb = text_emb_scratch_;
     {
         const auto t0 = SteadyClock::now();
-        if (is_cpu_backend(backend_) || !external_runner_->supports_encoder()) {
+        if (normal_native_npu) {
+            auto& g = npu_cpu_fallback_->encoder;
+            g.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
+            g.write_input_named("text_ids", {1, kTextT}, ids64.data(), ids64.size() * sizeof(int64_t));
+            g.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
+            g.run("text_encoder CPU fixed Run");
+            g.read_output({1, 256, kTextT}, text_emb.data(), text_emb.size() * sizeof(float));
+        } else if (native_compiled_graphs || is_cpu_backend(backend_) || !external_runner_->supports_encoder()) {
             interp_->encoder.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
             interp_->encoder.write_input_named("text_ids", {1, kTextT}, ids64.data(), ids64.size() * sizeof(int64_t));
             interp_->encoder.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
@@ -1621,11 +1736,25 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
         profile_.ve_step_ms.assign(static_cast<size_t>(total_step_), 0.0);
 
     const bool vector_on_cpu =
-        is_cpu_backend(backend_) || !external_runner_->supports_vector();
-    if (vector_on_cpu) {
-        // These five tensors are invariant for every flow-matching step in the
-        // current chunk. TFLite input tensors retain their contents across
-        // Invoke(), so copy them once instead of total_steps times.
+        !normal_native_npu &&
+        (native_compiled_graphs || is_cpu_backend(backend_) || !external_runner_->supports_vector());
+
+    if (normal_native_npu) {
+        auto& cpu_vec = npu_cpu_fallback_->vector;
+        cpu_vec.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
+        cpu_vec.write_input_named("latent_mask", {1, 1, L}, latent_mask.data(), latent_mask.size() * sizeof(float));
+        cpu_vec.write_input_named("total_step", {1}, &total_step_f, sizeof(float), 1);
+        cpu_vec.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
+        cpu_vec.write_input_named("text_emb", {1, 256, kTextT}, text_emb.data(), text_emb.size() * sizeof(float));
+
+        if (npu_vector_enabled_) {
+            interp_->vector.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
+            interp_->vector.write_input_named("latent_mask", {1, 1, L}, latent_mask.data(), latent_mask.size() * sizeof(float));
+            interp_->vector.write_input_named("total_step", {1}, &total_step_f, sizeof(float), 1);
+            interp_->vector.write_input_named("text_mask", {1, 1, kTextT}, tok.mask.data(), tok.mask.size() * sizeof(float));
+            interp_->vector.write_input_named("text_emb", {1, 256, kTextT}, text_emb.data(), text_emb.size() * sizeof(float));
+        }
+    } else if (vector_on_cpu) {
         interp_->vector.write_input_named("style_ttl", {1, 50, 256}, voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
         interp_->vector.write_input_named("latent_mask", {1, 1, L}, latent_mask.data(), latent_mask.size() * sizeof(float));
         interp_->vector.write_input_named("total_step", {1}, &total_step_f, sizeof(float), 1);
@@ -1637,7 +1766,45 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
         if (cancelled_.load()) return {};
         const auto t0 = SteadyClock::now();
         const float cur_step_f = static_cast<float>(step);
-        if (vector_on_cpu) {
+        if (normal_native_npu) {
+            auto run_cpu_vector = [&](float* dst, const float* src) {
+                auto& g = npu_cpu_fallback_->vector;
+                std::memcpy(dst, src, xt.size() * sizeof(float));
+                g.write_input_named("current_step", {1}, &cur_step_f, sizeof(float), 0);
+                g.write_input_named("noisy_latent", {1, kLatentChannels, L}, dst, xt.size() * sizeof(float));
+                g.run("vector_estimator CPU fallback Run");
+                g.read_output({1, kLatentChannels, L}, dst, xt.size() * sizeof(float));
+            };
+
+            if (npu_vector_enabled_) {
+                const std::vector<float> before = xt;
+                try {
+                    interp_->vector.write_input_named("current_step", {1}, &cur_step_f, sizeof(float), 0);
+                    interp_->vector.write_input_named("noisy_latent", {1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
+                    interp_->vector.run("vector_estimator Run");
+                    interp_->vector.read_output({1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
+
+                    if (!Graph::all_finite(xt.data(), xt.size())) {
+                        throw std::runtime_error(
+                            "vector estimator NPU returned NaN/Inf");
+                    }
+
+                    if (!npu_vector_validated_) {
+                        LOGI("[NPU-VE-ONLY] first finite VE step accepted; keeping NPU");
+                        npu_vector_validated_ = true;
+                    }
+                } catch (const std::exception& e) {
+                    LOGE("[NPU-VE-ONLY] VE rejected at step=%d: %s; switching VE to CPU",
+                         step + 1, e.what());
+                    run_cpu_vector(xt.data(), before.data());
+                    npu_vector_enabled_ = false;
+                    refresh_native_npu_report();
+                }
+            } else {
+                const std::vector<float> before = xt;
+                run_cpu_vector(xt.data(), before.data());
+            }
+        } else if (vector_on_cpu) {
             interp_->vector.write_input_named("current_step", {1}, &cur_step_f, sizeof(float), 0);
             interp_->vector.write_input_named("noisy_latent", {1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
             interp_->vector.run("vector_estimator Run");
@@ -1658,7 +1825,12 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     std::vector<float> wav(static_cast<size_t>(chunk_size) * L);
     {
         const auto t0 = SteadyClock::now();
-        if (is_cpu_backend(backend_) || !external_runner_->supports_vocoder()) {
+        if (normal_native_npu) {
+            auto& g = npu_cpu_fallback_->vocoder;
+            g.write_input_named("latent", {1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
+            g.run("vocoder CPU fixed Run");
+            g.read_output({1, chunk_size * L}, wav.data(), wav.size() * sizeof(float));
+        } else if (native_compiled_graphs || is_cpu_backend(backend_) || !external_runner_->supports_vocoder()) {
             interp_->vocoder.write_input_named("latent", {1, kLatentChannels, L}, xt.data(), xt.size() * sizeof(float));
             interp_->vocoder.run("vocoder Run");
             interp_->vocoder.read_output({1, chunk_size * L}, wav.data(), wav.size() * sizeof(float));

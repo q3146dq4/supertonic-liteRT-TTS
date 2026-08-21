@@ -15,8 +15,8 @@ enum class InferenceBackend(internal val nativeId: Int) {
     // the verified FP32 CPU baseline and automatically falls back to it.
     CPU_XNNPACK_FP16(3),
     GPU_LITERT(1),
-    // Explicitly experimental: unsafe Encoder/DSP-VE paths stay blocked. The
-    // retained QNN HTP vocoder probe automatically retries on CPU when rejected.
+    // Qualcomm NPU. Normal Soniqo uses native LiteRT 2.1.6 CompiledModel
+    // + QNN JIT; FULL FP16 uses the same native stack in strict W16A16 mode.
     QUALCOMM_NPU(2),
     // Native C++ only distinguishes CPU from an externally-owned runner.
     // Reuse its accelerator id while DelegateSupertonicRunner selects NNAPI.
@@ -132,6 +132,13 @@ internal class SpeechSynthesizerImpl(
                 madeRunner = RezaSupertonicRunner(
                     config.copy(backend = InferenceBackend.CPU_XNNPACK)
                 )
+            } else if (
+                config.ttsModel == TtsModel.SUPERTONIC &&
+                backend == InferenceBackend.QUALCOMM_NPU
+            ) {
+                // Normal Soniqo NPU uses native LiteRT 2.1.6 CompiledModel +
+                // Qualcomm compiler/dispatch JIT. Do not create Java QnnDelegate.
+                madeRunner = null
             } else if (!backend.isNativeCpu) {
                 madeRunner = DelegateSupertonicRunner(config.copy(backend = backend))
             }

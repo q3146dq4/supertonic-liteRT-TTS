@@ -173,6 +173,19 @@ private:
     struct InterpreterState;
     std::unique_ptr<InterpreterState> interp_;
 
+    // Normal Soniqo Qualcomm-NPU adaptive hybrid:
+    // CPU/XNNPACK reference graphs are kept beside the native NPU graphs so a
+    // numerically bad individual NPU stage can be rejected without discarding
+    // working NPU stages or restarting the whole synthesis request.
+    std::unique_ptr<InterpreterState> npu_cpu_fallback_;
+    bool npu_encoder_enabled_ = false;
+    bool npu_vector_enabled_ = false;
+    bool npu_vocoder_enabled_ = false;
+    bool npu_encoder_validated_ = false;
+    bool npu_vector_validated_ = false;
+    bool npu_vocoder_validated_ = false;
+    void refresh_native_npu_report();
+
     std::unique_ptr<SupertonicTokenizer> tokenizer_;
     std::unordered_map<std::string, VoiceStyle> voices_;
     std::string voice_id_ = "F1";
