@@ -145,7 +145,9 @@ bool ends_with_terminal(const std::vector<char32_t>& v) {
 }  // namespace
 
 SupertonicTokenizer::SupertonicTokenizer(const std::string& unicode_indexer_path,
-                                         const std::string& /*tts_json_path*/) {
+                                         const std::string& /*tts_json_path*/,
+                                         int max_text_tokens) {
+    max_text_tokens_ = std::max(8, max_text_tokens);
     // unicode_indexer.json is a flat array of 65536 ints (codepoint → id, -1 if unsupported).
     // speech-core's util/json.h has no array parser, so walk it with the primitives.
     const std::string text = json::read_file(unicode_indexer_path);

@@ -30,7 +30,8 @@ public:
     /// @param unicode_indexer_path flat JSON array of 65536 ints (`codepoint → id`, -1 if unsupported)
     /// @param tts_json_path        `tts.json` (read for forward-compat; AVAILABLE_LANGS is baked in)
     explicit SupertonicTokenizer(const std::string& unicode_indexer_path,
-                                 const std::string& tts_json_path = {});
+                                 const std::string& tts_json_path = {},
+                                 int max_text_tokens = 128);
 
     /// Whether `lang` (ISO code, e.g. "de", "ko") is in Supertonic's AVAILABLE_LANGS.
     bool supports(const std::string& lang) const;

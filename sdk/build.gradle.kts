@@ -67,6 +67,10 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("androidx.annotation:annotation:1.8.2")
 
+    // Reza2kn keeps vector_estimator as ONNX. CPUExecutionProvider matches the
+    // upstream reference implementation; 1.28.0 is the current Android AAR.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
+
     // Compile against the same Java Interpreter/GPU APIs that the app packages.
     // Runtime AARs live in :app so the Android library module does not try to
     // embed local AARs inside another AAR.

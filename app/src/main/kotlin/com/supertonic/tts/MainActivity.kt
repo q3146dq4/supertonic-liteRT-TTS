@@ -20,6 +20,7 @@ import audio.soniqo.speech.InferenceBackend
 import audio.soniqo.speech.SpeechSynthesizer
 import audio.soniqo.speech.SpeechSynthesizerConfig
 import audio.soniqo.speech.TtsSettings
+import audio.soniqo.speech.TtsModel
 import audio.soniqo.speech.rules.PronunciationRules
 import audio.soniqo.speech.audio.AudioSpeedProcessor
 import kotlinx.coroutines.CoroutineScope
@@ -54,6 +55,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stepsSpinner: Spinner
     private lateinit var threadsSpinner: Spinner
     private lateinit var backendSpinner: Spinner
+    private lateinit var modelSpinner: Spinner
     private lateinit var chunkSpinner: Spinner
     private lateinit var chunkManualInput: EditText
     private lateinit var preGenerationSpinner: Spinner
@@ -79,6 +81,12 @@ class MainActivity : AppCompatActivity() {
         "NNAPI (Experimental) / 자동 품질검사·CPU 복구" to InferenceBackend.NNAPI_DEVICE,
         "Qualcomm NPU/HTP (Experimental) / Snapdragon 전용" to InferenceBackend.QUALCOMM_NPU,
     )
+    private val modelChoices = listOf(
+        "Soniqo Supertonic-3 LiteRT" to TtsModel.SUPERTONIC,
+        "Soniqo FULL FP16 W16A16 (Experimental)" to TtsModel.SUPERTONIC_SONIQO_FULL_FP16,
+        "Reza2kn INT4+INT8 Hybrid" to TtsModel.SUPERTONIC_REZA,
+    )
+
     private val chunkModes = listOf(
         "보수적 · 짧게 (40)" to TtsSettings.CHUNK_CONSERVATIVE,
         "균형 · 기본 (64)" to TtsSettings.CHUNK_BALANCED,
@@ -98,6 +106,11 @@ class MainActivity : AppCompatActivity() {
     private val voiceImport = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) importCustomVoice(uri)
     }
+    private val fullFp16ZipImport =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) importFullFp16Zip(uri)
+        }
+
     private val ruleImport = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) importRules(uri)
     }
@@ -125,14 +138,41 @@ class MainActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 28, 32, 32) }
         root.addView(TextView(this).apply { text = "Supertonic LiteRT"; textSize = 30f })
         root.addView(TextView(this).apply {
-            text = "Soniqo Supertonic-3 · LiteRT 4-graph\nVoice / Speed / Steps 설정은 시스템 TTS에도 적용됩니다."
+            text = "Soniqo LiteRT / Reza2kn Hybrid\nVoice / Speed / Steps / Pre-generation 설정은 시스템 TTS에도 적용됩니다."
             textSize = 14f; setPadding(0, 4, 0, 18)
         })
+
+        root.addView(TextView(this).apply {
+            text = "Model"
+            textSize = 16f
+            setPadding(0, 4, 0, 4)
+        })
+        modelSpinner = Spinner(this)
+        modelSpinner.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            modelChoices.map { it.first },
+        )
+        root.addView(modelSpinner)
+
         status = TextView(this).apply { text = "모델 준비 확인 중…"; textSize = 16f }
         root.addView(status)
         root.addView(Button(this).apply {
-            text = "모델 다운로드 / 재확인 (약 380 MB)"
+            text = "선택 모델 다운로드 / 재확인"
             setOnClickListener { ensureModel(force = true) }
+        })
+        root.addView(Button(this).apply {
+            text = "FULL FP16 ZIP 가져오기"
+            setOnClickListener {
+                fullFp16ZipImport.launch(
+                    arrayOf(
+                        "application/zip",
+                        "application/x-zip-compressed",
+                        "application/octet-stream",
+                        "*/*",
+                    )
+                )
+            }
         })
 
         root.addView(TextView(this).apply { text = "Speaker / Voice ID"; textSize = 16f; setPadding(0, 20, 0, 4) })
@@ -339,11 +379,36 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restoreSettings() {
+        val savedModel = TtsSettings.ttsModel(this)
+        modelSpinner.setSelection(
+            modelChoices.indexOfFirst { it.second == savedModel }
+                .takeIf { it >= 0 } ?: 0
+        )
         val savedVoice = TtsSettings.voice(this)
         voiceSpinner.setSelection(voiceIds.indexOf(savedVoice).takeIf { it >= 0 } ?: 0)
         stepsSpinner.setSelection(steps.indexOf(TtsSettings.steps(this)).takeIf { it >= 0 } ?: steps.indexOf(4))
         threadsSpinner.setSelection(threadCounts.indexOf(TtsSettings.threads(this)).takeIf { it >= 0 } ?: threadCounts.indexOf(4))
-        backendSpinner.setSelection(backends.indexOfFirst { it.second == TtsSettings.backend(this) }.takeIf { it >= 0 } ?: 0)
+        val restoredBackend = when (savedModel) {
+            TtsModel.SUPERTONIC_REZA -> InferenceBackend.CPU_XNNPACK
+            TtsModel.SUPERTONIC_SONIQO_FULL_FP16 -> {
+                val saved = TtsSettings.backend(this)
+                if (
+                    saved == InferenceBackend.GPU_LITERT ||
+                    saved == InferenceBackend.QUALCOMM_NPU
+                ) saved else InferenceBackend.GPU_LITERT
+            }
+            else -> TtsSettings.backend(this)
+        }
+        backendSpinner.setSelection(
+            backends.indexOfFirst { it.second == restoredBackend }
+                .takeIf { it >= 0 } ?: 0
+        )
+        backendSpinner.isEnabled = savedModel != TtsModel.SUPERTONIC_REZA
+        preGenerationSpinner.isEnabled =
+            savedModel != TtsModel.SUPERTONIC_SONIQO_FULL_FP16
+        if (savedModel == TtsModel.SUPERTONIC_SONIQO_FULL_FP16) {
+            preGenerationSpinner.setSelection(0)
+        }
         chunkSpinner.setSelection(chunkModes.indexOfFirst { it.second == TtsSettings.chunkMode(this) }.takeIf { it >= 0 } ?: 1)
         chunkManualInput.setText(TtsSettings.manualChunkCap(this).toString())
         chunkManualInput.visibility = if (TtsSettings.chunkMode(this) == TtsSettings.CHUNK_MANUAL) android.view.View.VISIBLE else android.view.View.GONE
@@ -363,7 +428,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshVoices(selected: String? = TtsSettings.voice(this)) {
-        val modelDir = runCatching { ModelManager.modelDir(applicationContext) }.getOrNull()
+        val modelDir = runCatching { ModelManager.modelDir(applicationContext, currentTtsModel()) }.getOrNull()
         val custom = modelDir?.resolve("voice_styles")?.listFiles()?.asSequence()
             ?.filter { it.extension.equals("json", true) }
             ?.map { it.nameWithoutExtension }
@@ -403,6 +468,55 @@ class MainActivity : AppCompatActivity() {
                 synthesizer = null
             }
         }
+        modelSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+
+            override fun onItemSelected(
+                parent: android.widget.AdapterView<*>?,
+                view: android.view.View?,
+                position: Int,
+                id: Long,
+            ) {
+                val model = currentTtsModel()
+                TtsSettings.setTtsModel(this@MainActivity, model)
+
+                val reza = model == TtsModel.SUPERTONIC_REZA
+                val fullFp16 =
+                    model == TtsModel.SUPERTONIC_SONIQO_FULL_FP16
+                backendSpinner.isEnabled = !reza
+                preGenerationSpinner.isEnabled = !fullFp16
+                if (fullFp16) {
+                    preGenerationSpinner.setSelection(0)
+                    val selected = backends[
+                        backendSpinner.selectedItemPosition
+                            .coerceIn(0, backends.lastIndex)
+                    ].second
+                    if (
+                        selected != InferenceBackend.GPU_LITERT &&
+                        selected != InferenceBackend.QUALCOMM_NPU
+                    ) {
+                        val gpuIndex = backends.indexOfFirst {
+                            it.second == InferenceBackend.GPU_LITERT
+                        }.coerceAtLeast(0)
+                        backendSpinner.setSelection(gpuIndex)
+                    }
+                } else if (reza) {
+                    val cpuIndex = backends.indexOfFirst {
+                        it.second == InferenceBackend.CPU_XNNPACK
+                    }.coerceAtLeast(0)
+                    if (backendSpinner.selectedItemPosition != cpuIndex) {
+                        backendSpinner.setSelection(cpuIndex)
+                    }
+                }
+
+                // Deliberately leave OFF / 2 / 3 pre-generation unchanged.
+                synthesizer?.close()
+                synthesizer = null
+                refreshVoices()
+                ensureModel()
+            }
+        }
+
         backendSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
@@ -477,7 +591,19 @@ class MainActivity : AppCompatActivity() {
     private fun currentVoice(): String = voiceIds[voiceSpinner.selectedItemPosition.coerceIn(0, voiceIds.lastIndex)]
     private fun currentSteps(): Int = steps[stepsSpinner.selectedItemPosition.coerceIn(0, steps.lastIndex)]
     private fun currentThreads(): Int = threadCounts[threadsSpinner.selectedItemPosition.coerceIn(0, threadCounts.lastIndex)]
-    private fun currentBackend(): InferenceBackend = backends[backendSpinner.selectedItemPosition.coerceIn(0, backends.lastIndex)].second
+    private fun currentTtsModel(): TtsModel =
+        modelChoices[
+            modelSpinner.selectedItemPosition.coerceIn(0, modelChoices.lastIndex)
+        ].second
+
+    private fun currentBackend(): InferenceBackend =
+        if (currentTtsModel() == TtsModel.SUPERTONIC_REZA) {
+            InferenceBackend.CPU_XNNPACK
+        } else {
+            backends[
+                backendSpinner.selectedItemPosition.coerceIn(0, backends.lastIndex)
+            ].second
+        }
     private fun currentChunkMode(): String = chunkModes[chunkSpinner.selectedItemPosition.coerceIn(0, chunkModes.lastIndex)].second
     private fun currentManualChunkCap(): Int = chunkManualInput.text?.toString()?.toIntOrNull()?.coerceIn(TtsSettings.MIN_CHUNK_CAP, TtsSettings.MAX_CHUNK_CAP) ?: TtsSettings.manualChunkCap(this)
     private fun currentChunkCap(): Int = when (currentChunkMode()) {
@@ -498,38 +624,97 @@ class MainActivity : AppCompatActivity() {
         TtsSettings.setStreamingControls(this, preGenerationQueue(), currentChunkGapMin(), currentChunkGapMax(), currentTrailingTrim())
         TtsSettings.setTestLanguage(this, currentLanguage())
         TtsSettings.setBackend(this, currentBackend())
+        TtsSettings.setTtsModel(this, currentTtsModel())
     }
 
     private fun ensureModel(force: Boolean = false) {
         if (modelJob?.isActive == true) return
-        if (!force && ModelManager.areTtsModelsReady(this)) {
-            status.text = "Soniqo Supertonic-3 모델 준비 완료 (약 380 MB)"
+        if (!force && ModelManager.areTtsModelsReady(this, currentTtsModel())) {
+            status.text = "${ModelManager.modelLabel(currentTtsModel())} 준비 완료"
             refreshVoices()
+            return
+        }
+        if (
+            ModelManager.isLocalOnly(currentTtsModel()) &&
+            !ModelManager.areTtsModelsReady(this, currentTtsModel())
+        ) {
+            status.text =
+                "${ModelManager.modelLabel(currentTtsModel())}\n로컬 FP16 ZIP 설치가 필요합니다."
             return
         }
         modelJob = scope.launch {
             status.text = "모델 확인/다운로드 중… 0%"
             runCatching {
-                ModelManager.ensureTtsModels(applicationContext) { done, total, file ->
+                ModelManager.ensureTtsModels(
+                    applicationContext,
+                    currentTtsModel(),
+                ) { done, total, file ->
                     val percent = ((done * 100.0) / total.coerceAtLeast(1L)).coerceIn(0.0, 100.0).roundToInt()
                     runOnUiThread { status.text = "모델 다운로드/확인 중… $percent%\n$file" }
                 }
             }.onSuccess {
-                status.text = "Soniqo Supertonic-3 모델 준비 완료 (약 380 MB)"
+                status.text = "${ModelManager.modelLabel(currentTtsModel())} 준비 완료"
                 refreshVoices()
             }.onFailure { e -> status.text = "모델 준비 실패:\n${e.message}\n\n다시 시도해 주세요." }
         }
     }
 
+    private fun importFullFp16Zip(uri: Uri) {
+        if (synthJob?.isActive == true) synthesizer?.stop()
+        synthJob?.cancel()
+        synthesizer?.close()
+        synthesizer = null
+
+        status.text = "FULL FP16 ZIP 검증 및 설치 중…"
+
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    FullFp16ZipImporter.install(applicationContext, uri)
+                }
+            }.onSuccess { result ->
+                val modelIndex = modelChoices.indexOfFirst {
+                    it.second == TtsModel.SUPERTONIC_SONIQO_FULL_FP16
+                }.coerceAtLeast(0)
+
+                modelSpinner.setSelection(modelIndex)
+                TtsSettings.setTtsModel(
+                    this@MainActivity,
+                    TtsModel.SUPERTONIC_SONIQO_FULL_FP16,
+                )
+                refreshVoices()
+
+                val mib = result.installedBytes.toDouble() / (1024.0 * 1024.0)
+                status.text = String.format(
+                    Locale.US,
+                    "Soniqo FULL FP16 설치 완료 · %.1f MiB",
+                    mib,
+                )
+                Toast.makeText(
+                    this@MainActivity,
+                    "FULL FP16 모델 설치 완료",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }.onFailure { e ->
+                status.text = "FULL FP16 ZIP 설치 실패:\n${e.message ?: e.javaClass.simpleName}"
+                Toast.makeText(
+                    this@MainActivity,
+                    "FULL FP16 ZIP 설치 실패: ${e.message ?: e.javaClass.simpleName}",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
     private fun ensureModelAnd(action: () -> Unit) {
-        if (ModelManager.areTtsModelsReady(this)) action() else {
+        if (ModelManager.areTtsModelsReady(this, currentTtsModel())) action() else {
             ensureModel()
             Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun showCustomVoiceManager() {
-        val dir = File(ModelManager.modelDir(applicationContext), "voice_styles")
+        val dir = File(ModelManager.modelDir(applicationContext, currentTtsModel()), "voice_styles")
         val files = dir.listFiles()?.filter { it.extension.equals("json", true) && it.nameWithoutExtension !in builtinVoices }.orEmpty().sortedBy { it.name.lowercase(Locale.ROOT) }
         if (files.isEmpty()) { Toast.makeText(this, "삭제할 Custom Voice가 없습니다.", Toast.LENGTH_SHORT).show(); return }
         val names = files.map { it.nameWithoutExtension.removePrefix("custom_") }.toTypedArray()
@@ -548,9 +733,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun importCustomVoice(uri: Uri) {
+        val ttsModel = currentTtsModel()
         scope.launch(Dispatchers.IO) {
             try {
-                val dir = File(ModelManager.modelDir(applicationContext), "voice_styles").apply { mkdirs() }
+                val dir = File(
+                    ModelManager.modelDir(applicationContext, ttsModel),
+                    "voice_styles",
+                ).apply { mkdirs() }
                 val rawName = contentResolver.query(uri, null, null, null, null)?.use { c ->
                     val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                     if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
@@ -608,7 +797,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startNonStreamingBenchmark() {
-        if (!ModelManager.areTtsModelsReady(this)) {
+        if (!ModelManager.areTtsModelsReady(this, currentTtsModel())) {
             ensureModel()
             Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show()
             return
@@ -639,6 +828,7 @@ class MainActivity : AppCompatActivity() {
         val gapMax = currentChunkGapMax()
         val trailingTrim = currentTrailingTrim()
         val originalThreads = currentThreads()
+        val ttsModel = currentTtsModel()
 
         data class BenchResult(
             val threads: Int,
@@ -662,7 +852,7 @@ class MainActivity : AppCompatActivity() {
                     val result = withContext(Dispatchers.Default) {
                         val initStart = System.nanoTime()
                         val benchSynth = SpeechSynthesizer(SpeechSynthesizerConfig(
-                            modelDir = ModelManager.modelDir(applicationContext).absolutePath,
+                            modelDir = ModelManager.modelDir(applicationContext, ttsModel).absolutePath,
                             voiceId = voice,
                             speed = 1.0f,
                             totalSteps = stepCount,
@@ -670,6 +860,7 @@ class MainActivity : AppCompatActivity() {
                             chunkCap = chunkCap,
                             useNnapi = false,
                             backend = InferenceBackend.CPU_XNNPACK,
+                            ttsModel = ttsModel,
                             preGenerationQueue = pregenQueue,
                             chunkGapMinMs = gapMin,
                             chunkGapMaxMs = gapMax,
@@ -738,7 +929,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startStreamingBenchmark() {
-        if (!ModelManager.areTtsModelsReady(this)) {
+        if (!ModelManager.areTtsModelsReady(this, currentTtsModel())) {
             ensureModel()
             Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show()
             return
@@ -770,6 +961,7 @@ class MainActivity : AppCompatActivity() {
         val gapMax = currentChunkGapMax()
         val trailingTrim = currentTrailingTrim()
         val originalThreads = currentThreads()
+        val ttsModel = currentTtsModel()
 
         data class StreamBenchResult(
             val threads: Int,
@@ -802,7 +994,7 @@ class MainActivity : AppCompatActivity() {
                     val result = withContext(Dispatchers.Default) {
                         val initStart = System.nanoTime()
                         val benchSynth = SpeechSynthesizer(SpeechSynthesizerConfig(
-                            modelDir = ModelManager.modelDir(applicationContext).absolutePath,
+                            modelDir = ModelManager.modelDir(applicationContext, ttsModel).absolutePath,
                             voiceId = voice,
                             speed = 1.0f,
                             totalSteps = stepCount,
@@ -810,6 +1002,7 @@ class MainActivity : AppCompatActivity() {
                             chunkCap = chunkCap,
                             useNnapi = false,
                             backend = InferenceBackend.CPU_XNNPACK,
+                            ttsModel = ttsModel,
                             preGenerationQueue = pregenQueue,
                             chunkGapMinMs = gapMin,
                             chunkGapMaxMs = gapMax,
@@ -912,7 +1105,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startSynthesis() {
-        if (!ModelManager.areTtsModelsReady(this)) { ensureModel(); Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show(); return }
+        if (!ModelManager.areTtsModelsReady(this, currentTtsModel())) { ensureModel(); Toast.makeText(this, "모델 준비가 먼저 필요합니다.", Toast.LENGTH_SHORT).show(); return }
         persistUiSettings(); player?.stop(); player?.release(); player = null
         // Coroutine cancellation cannot interrupt a blocking JNI call. Explicitly signal
         // the native engine as well, otherwise a newly launched synthesis can sit on the
@@ -923,6 +1116,7 @@ class MainActivity : AppCompatActivity() {
         if (original.isBlank()) { Toast.makeText(this, "텍스트를 입력하세요.", Toast.LENGTH_SHORT).show(); return }
         val text = PronunciationRules.apply(this, original)
         val voice = currentVoice(); val speed = currentSpeed(); val stepCount = currentSteps()
+        val ttsModel = currentTtsModel()
         val selectedLang = currentLanguage()
         val lang = if (selectedLang == "na" ||
             (allowNaCheck.isChecked && PronunciationRules.isMixedScript(text))) "na" else selectedLang
@@ -939,7 +1133,7 @@ class MainActivity : AppCompatActivity() {
                 val value = withContext(Dispatchers.Default) {
                     workerDispatchWaitMs = (System.nanoTime() - requestStartNs) / 1_000_000.0
                     val engineStartNs = System.nanoTime()
-                    val synth = getOrCreateSynthesizer(ModelManager.modelDir(applicationContext).absolutePath)
+                    val synth = getOrCreateSynthesizer(ModelManager.modelDir(applicationContext, ttsModel).absolutePath, ttsModel)
                     engineAcquireMs = (System.nanoTime() - engineStartNs) / 1_000_000.0
 
                     val settingsStartNs = System.nanoTime()
@@ -1002,11 +1196,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun getOrCreateSynthesizer(dir: String): SpeechSynthesizer {
+    private fun getOrCreateSynthesizer(dir: String, ttsModel: TtsModel): SpeechSynthesizer {
         synthesizer?.let { return it }
         val started = TimeSource.Monotonic.markNow()
         return SpeechSynthesizer(SpeechSynthesizerConfig(
-            modelDir = dir, voiceId = currentVoice(), speed = 1.0f, totalSteps = currentSteps(), numThreads = currentThreads(), chunkCap = currentChunkCap(), useNnapi = false, backend = currentBackend(),
+            modelDir = dir, voiceId = currentVoice(), speed = 1.0f, totalSteps = currentSteps(), numThreads = currentThreads(), chunkCap = currentChunkCap(), useNnapi = false, backend = currentBackend(), ttsModel = ttsModel,
             preGenerationQueue = preGenerationQueue(), chunkGapMinMs = currentChunkGapMin(), chunkGapMaxMs = currentChunkGapMax(), trailingSilenceTrimMs = currentTrailingTrim(),
             nativeLibraryDir = applicationInfo.nativeLibraryDir,
             acceleratorCacheDir = File(cacheDir, "accelerator_cache").apply { mkdirs() }.absolutePath
@@ -1091,6 +1285,7 @@ class MainActivity : AppCompatActivity() {
         sb.append("Audio RMS               ").append(profile["rms"] ?: "?").append('\n')
         sb.append("Leading silence         ").append(profile["lead_silence_ms"] ?: "?").append(" ms\n")
         sb.append("Trailing silence        ").append(profile["trail_silence_ms"] ?: "?").append(" ms\n")
+        sb.append("Model                   ").append(profile["model"] ?: currentTtsModel().name).append('\n')
         sb.append("Backend report          ").append(profile["backend"] ?: currentBackend().name).append('\n')
         sb.append("Requested backend       ").append(profile["requested_backend"] ?: currentBackend().name).append('\n')
         sb.append("Active backend          ").append(profile["active_backend"] ?: currentBackend().name).append('\n')

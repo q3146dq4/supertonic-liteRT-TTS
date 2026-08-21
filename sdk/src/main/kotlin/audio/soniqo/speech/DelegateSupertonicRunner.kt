@@ -32,9 +32,9 @@ import java.util.concurrent.atomic.AtomicReference
  * MediaTek/Samsung/Tensor devices and probes VE/Vocoder. Delegate creation and
  * invokes stay on one HandlerThread.
  */
-class DelegateSupertonicRunner(
+internal class DelegateSupertonicRunner(
     private val config: SpeechSynthesizerConfig,
-) : AutoCloseable {
+) : SupertonicRunnerBridge {
     companion object {
         private const val TAG = "SupertonicAccel"
 
@@ -361,11 +361,13 @@ class DelegateSupertonicRunner(
         }
     }
 
-    fun hasDuration(): Boolean = graphs.get()?.duration != null
-    fun hasEncoder(): Boolean = graphs.get()?.encoder != null
-    fun hasVector(): Boolean = graphs.get()?.vector != null
-    fun hasVocoder(): Boolean = graphs.get()?.vocoder != null
-    fun backendReport(): String = report.get()
+    override fun hasDuration(): Boolean = graphs.get()?.duration != null
+    override fun hasEncoder(): Boolean = graphs.get()?.encoder != null
+    override fun hasVector(): Boolean = graphs.get()?.vector != null
+    override fun hasVocoder(): Boolean = graphs.get()?.vocoder != null
+    override fun backendReport(): String = report.get()
+
+    override fun cloneForPreGeneration(): SupertonicRunnerBridge? = null
 
     private fun <T> callOnRunner(block: () -> T): T {
         if (Looper.myLooper() == thread.looper) return block()
@@ -383,19 +385,19 @@ class DelegateSupertonicRunner(
         return result.get() as T
     }
 
-    fun runDuration(ids: ByteBuffer, styleDp: ByteBuffer, mask: ByteBuffer, out: ByteBuffer) =
+    override fun runDuration(ids: ByteBuffer, styleDp: ByteBuffer, mask: ByteBuffer, out: ByteBuffer) =
         callOnRunner {
             (graphs.get()?.duration ?: error("Accelerator runner does not execute duration"))
                 .duration(ids, styleDp, mask, out)
         }
 
-    fun runEncoder(ids: ByteBuffer, styleTtl: ByteBuffer, mask: ByteBuffer, out: ByteBuffer) =
+    override fun runEncoder(ids: ByteBuffer, styleTtl: ByteBuffer, mask: ByteBuffer, out: ByteBuffer) =
         callOnRunner {
             (graphs.get()?.encoder ?: error("Accelerator runner does not execute encoder"))
                 .encoder(ids, styleTtl, mask, out)
         }
 
-    fun runVector(
+    override fun runVector(
         noisyLatent: ByteBuffer,
         textEmb: ByteBuffer,
         styleTtl: ByteBuffer,
@@ -411,7 +413,7 @@ class DelegateSupertonicRunner(
         )
     }
 
-    fun runVocoder(latent: ByteBuffer, out: ByteBuffer) =
+    override fun runVocoder(latent: ByteBuffer, out: ByteBuffer) =
         callOnRunner {
             (graphs.get()?.vocoder ?: error("Accelerator runner does not execute vocoder")).vocoder(latent, out)
         }

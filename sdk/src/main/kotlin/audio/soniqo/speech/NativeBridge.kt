@@ -15,7 +15,7 @@ internal object NativeBridge {
         chunkCap: Int,
         nativeLibraryDir: String,
         acceleratorCacheDir: String,
-        acceleratorRunner: DelegateSupertonicRunner?,
+        acceleratorRunner: SupertonicRunnerBridge?,
     ): Long
     external fun nativeDestroySynthesizer(handle: Long)
     external fun nativeStopSynthesizer(handle: Long)

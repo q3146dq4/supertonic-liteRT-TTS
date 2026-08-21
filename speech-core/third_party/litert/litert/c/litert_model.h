@@ -230,11 +230,13 @@ LiteRtStatus LiteRtGetSignatureOutputTensorByIndex(LiteRtSignature signature,
 // LiteRtModel
 //
 
-LiteRtStatus LiteRtCreateModelFromFile(const char* filename,
+LiteRtStatus LiteRtCreateModelFromFile(LiteRtEnvironment environment,
+                                       const char* filename,
                                        LiteRtModel* model);
 // The caller must ensure that the buffer remains valid for the lifetime of
 // the model.
-LiteRtStatus LiteRtCreateModelFromBuffer(const void* buffer_addr,
+LiteRtStatus LiteRtCreateModelFromBuffer(LiteRtEnvironment environment,
+                                         const void* buffer_addr,
                                          size_t buffer_size,
                                          LiteRtModel* model);
 // Creates a model from the given file descriptor region. LiteRT duplicates the

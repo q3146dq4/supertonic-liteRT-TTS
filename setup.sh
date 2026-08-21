@@ -4,7 +4,7 @@ set -euo pipefail
 # Supertonic LiteRT v0.1.4 runtime setup — guarded accelerator experiments.
 #
 # CPU path:
-#   Native speech-core + LiteRT 2.1.5 libLiteRt.so + XNNPACK (unchanged).
+#   Native speech-core + LiteRT 2.1.6 libLiteRt.so + XNNPACK.
 # GPU path:
 #   Snapdragon uses QNN GPU/hybrid precision for compatible heavy graphs.
 #   Other chipsets probe vocoder with Java LiteRT 1.4.2 GpuDelegate FP16.
@@ -16,7 +16,7 @@ set -euo pipefail
 # Qualcomm AARs are downloaded directly and cached because
 #   Gradle's large qnn-runtime download was extremely slow on the user's route.
 
-LITERT_NATIVE_VERSION="2.1.5"
+LITERT_NATIVE_VERSION="2.1.6"
 QNN_VERSION="2.49.0"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 LITERT_DIR="${ROOT}/litert"
@@ -38,7 +38,7 @@ echo "Java Interpreter/GPU: LiteRT 1.4.2"
 echo "Qualcomm QNN Delegate: ${QNN_VERSION}"
 
 # ---------------------------------------------------------------------------
-# Native LiteRT 2.1.5 for the already-verified CPU/XNNPACK C++ path.
+# Native LiteRT 2.1.6 for CPU/XNNPACK + W16A16 CompiledModel GPU.
 # ---------------------------------------------------------------------------
 LITERT_AAR_URL="https://dl.google.com/dl/android/maven2/com/google/ai/edge/litert/litert/${LITERT_NATIVE_VERSION}/litert-${LITERT_NATIVE_VERSION}.aar"
 CACHED_LITERT_AAR="${CPU_CACHE}/litert-${LITERT_NATIVE_VERSION}.aar"
@@ -62,11 +62,19 @@ for abi in arm64-v8a x86_64; do
         exit 1
     fi
     cp -f "$src" "${LITERT_DIR}/${abi}/libLiteRt.so"
+
+    gpu_src="${TMP}/litert/jni/${abi}/libLiteRtClGlAccelerator.so"
+    if [ ! -s "$gpu_src" ]; then
+        echo "[ERROR] ${abi}/libLiteRtClGlAccelerator.so missing from LiteRT ${LITERT_NATIVE_VERSION} AAR"
+        exit 1
+    fi
+    mkdir -p "${ROOT}/sdk/src/main/jniLibs/${abi}"
+    cp -f "$gpu_src" "${ROOT}/sdk/src/main/jniLibs/${abi}/libLiteRtClGlAccelerator.so"
 done
 
-# Remove stale CompiledModel GPU/QNN plugins from earlier experiments. They are
-# intentionally not used by this build; Java-owned delegates are isolated from
-# the native CPU runtime instead of sharing native delegate handles.
+# Remove obsolete accelerator/plugin copies from earlier experiments.
+# Keep libLiteRtClGlAccelerator.so: LiteRT V2 CompiledModel GPU dynamically
+# discovers this sidecar from Android nativeLibraryDir.
 for abi in arm64-v8a x86_64; do
     jni="${ROOT}/sdk/src/main/jniLibs/${abi}"
     mkdir -p "$jni"

@@ -34,6 +34,7 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            keepDebugSymbols += setOf("**/libQnnHtpV81Skel.so")
         }
     }
 }
@@ -48,7 +49,7 @@ dependencies {
     implementation(project(":sdk"))
 
     // Java Interpreter runtime used only by the isolated GPU/NNAPI delegate
-    // runner. Native CPU/XNNPACK remains on libLiteRt.so 2.1.5. No delegate
+    // runner. Native CPU/XNNPACK and W16A16 CompiledModel use libLiteRt.so 2.1.6. No delegate
     // handles cross from this Java runtime into the native CPU runtime.
     implementation(files("libs/litert-api.aar"))
     implementation(files("libs/litert.aar"))

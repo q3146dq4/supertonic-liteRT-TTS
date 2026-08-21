@@ -1,7 +1,9 @@
 #include <jni.h>
+#include <stdlib.h>
 #include <android/log.h>
 
 #include <speech_core/models/litert_supertonic_tts.h>
+#include <speech_core/models/litert_engine.h>
 #include <speech_core/interfaces.h>
 
 #include <algorithm>
@@ -44,6 +46,8 @@ static double jni_elapsed_ms(JniClock::time_point a, JniClock::time_point b) {
 }
 
 static constexpr int TTS_SUPERTONIC = 1;
+static constexpr int TTS_SUPERTONIC_REZA = 2;
+static constexpr int TTS_SUPERTONIC_SONIQO_FULL_FP16 = 3;
 
 static std::string to_string(JNIEnv* env, jstring s) {
     if (!s) return {};
@@ -80,7 +84,8 @@ static std::string consume_java_exception(JNIEnv* env, const char* where) {
 
 class JniSupertonicRunner final : public speech_core::SupertonicExternalRunner {
 public:
-    JniSupertonicRunner(JNIEnv* env, jobject runner) {
+    JniSupertonicRunner(JNIEnv* env, jobject runner, bool owns_java_runner = false)
+        : owns_java_runner_(owns_java_runner) {
         if (!runner) throw std::runtime_error("accelerator runner object is null");
         if (env->GetJavaVM(&jvm_) != JNI_OK || !jvm_) {
             throw std::runtime_error("GetJavaVM failed for accelerator runner");
@@ -103,9 +108,15 @@ public:
         jmethodID has_vector = env->GetMethodID(cls, "hasVector", "()Z");
         jmethodID has_vocoder = env->GetMethodID(cls, "hasVocoder", "()Z");
         jmethodID backend_report = env->GetMethodID(cls, "backendReport", "()Ljava/lang/String;");
+        clone_for_pregen_ = env->GetMethodID(
+            cls,
+            "cloneForPreGeneration",
+            "()Laudio/soniqo/speech/SupertonicRunnerBridge;");
+        close_ = env->GetMethodID(cls, "close", "()V");
         const std::string err = consume_java_exception(env, "accelerator method lookup failed");
         if (!err.empty() || !duration_ || !encoder_ || !vector_ || !vocoder_ ||
-            !has_duration || !has_encoder || !has_vector || !has_vocoder || !backend_report) {
+            !has_duration || !has_encoder || !has_vector || !has_vocoder ||
+            !backend_report || !clone_for_pregen_ || !close_) {
             env->DeleteLocalRef(cls);
             env->DeleteGlobalRef(runner_);
             runner_ = nullptr;
@@ -132,6 +143,10 @@ public:
     ~JniSupertonicRunner() override {
         bool attached = false;
         if (JNIEnv* env = get_env(attached)) {
+            if (runner_ && owns_java_runner_ && close_) {
+                env->CallVoidMethod(runner_, close_);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
             if (runner_) env->DeleteGlobalRef(runner_);
         }
         runner_ = nullptr;
@@ -143,6 +158,31 @@ public:
     bool supports_vector() const override { return supports_vector_; }
     bool supports_vocoder() const override { return supports_vocoder_; }
     std::string backend_report() const override { return backend_report_; }
+
+    std::shared_ptr<speech_core::SupertonicExternalRunner>
+    clone_for_pregeneration() override {
+        bool attached = false;
+        JNIEnv* env = require_env(attached);
+        jobject clone = env->CallObjectMethod(runner_, clone_for_pregen_);
+        const std::string error =
+            consume_java_exception(env, "pre-generation runner clone failed");
+
+        std::shared_ptr<speech_core::SupertonicExternalRunner> out;
+        if (error.empty() && clone) {
+            try {
+                out = std::make_shared<JniSupertonicRunner>(
+                    env, clone, /*owns_java_runner=*/true);
+            } catch (...) {
+                env->DeleteLocalRef(clone);
+                if (attached && jvm_) jvm_->DetachCurrentThread();
+                throw;
+            }
+        }
+        if (clone) env->DeleteLocalRef(clone);
+        if (attached && jvm_) jvm_->DetachCurrentThread();
+        if (!error.empty()) throw std::runtime_error(error);
+        return out;
+    }
 
     void run_duration(const int64_t* text_ids, size_t text_ids_count,
                       const float* style_dp, size_t style_dp_count,
@@ -179,22 +219,29 @@ public:
                     const float* text_mask, size_t text_mask_count,
                     float current_step, float total_step) override {
         bool attached = false; JNIEnv* env = require_env(attached);
-        float cur = current_step, total = total_step;
-        std::vector<float> out(noisy_latent_count);
+        current_step_scratch_ = current_step;
+        total_step_scratch_ = total_step;
+        vector_output_scratch_.resize(noisy_latent_count);
         jobject a = buffer(env, noisy_latent, noisy_latent_count * sizeof(float));
         jobject b = buffer(env, text_emb, text_emb_count * sizeof(float));
         jobject c = buffer(env, style_ttl, style_ttl_count * sizeof(float));
         jobject d = buffer(env, latent_mask, latent_mask_count * sizeof(float));
         jobject e = buffer(env, text_mask, text_mask_count * sizeof(float));
-        jobject f = buffer(env, &cur, sizeof(float));
-        jobject g = buffer(env, &total, sizeof(float));
+        jobject f = buffer(env, &current_step_scratch_, sizeof(float));
+        jobject g = buffer(env, &total_step_scratch_, sizeof(float));
         // Do not alias an Interpreter input and output buffer. Some delegates
         // bind external memory directly and are not required to support aliasing.
-        jobject h = buffer(env, out.data(), out.size() * sizeof(float));
+        jobject h = buffer(
+            env,
+            vector_output_scratch_.data(),
+            vector_output_scratch_.size() * sizeof(float));
         env->CallVoidMethod(runner_, vector_, a,b,c,d,e,f,g,h);
         cleanup(env, {a,b,c,d,e,f,g,h});
-        finish(env, attached, "QNN/GPU vector estimator invoke failed");
-        std::memcpy(noisy_latent, out.data(), out.size() * sizeof(float));
+        finish(env, attached, "Supertonic external vector estimator invoke failed");
+        std::memcpy(
+            noisy_latent,
+            vector_output_scratch_.data(),
+            vector_output_scratch_.size() * sizeof(float));
     }
 
     void run_vocoder(const float* latent, size_t latent_count,
@@ -211,6 +258,11 @@ private:
     JavaVM* jvm_ = nullptr;
     jobject runner_ = nullptr;
     jmethodID duration_ = nullptr, encoder_ = nullptr, vector_ = nullptr, vocoder_ = nullptr;
+    jmethodID clone_for_pregen_ = nullptr, close_ = nullptr;
+    bool owns_java_runner_ = false;
+    float current_step_scratch_ = 0.0f;
+    float total_step_scratch_ = 0.0f;
+    std::vector<float> vector_output_scratch_;
     bool supports_duration_ = false;
     bool supports_encoder_ = false;
     bool supports_vector_ = false;
@@ -255,8 +307,25 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
     JNIEnv* env, jobject, jstring modelDir, jboolean useNnapi, jint backend, jint ttsModel,
     jstring voiceId, jint totalSteps, jfloat speed, jint numThreads, jint chunkCap,
     jstring nativeLibraryDir, jstring acceleratorCacheDir, jobject acceleratorRunner) {
-    if (ttsModel != TTS_SUPERTONIC) {
-        throw_runtime(env, "Only Supertonic is supported by this TTS engine");
+    if (ttsModel != TTS_SUPERTONIC &&
+        ttsModel != TTS_SUPERTONIC_REZA &&
+        ttsModel != TTS_SUPERTONIC_SONIQO_FULL_FP16) {
+        throw_runtime(env, "Unknown Supertonic model variant");
+        return 0;
+    }
+    const bool reza_hybrid = ttsModel == TTS_SUPERTONIC_REZA;
+    const bool strict_full_fp16 =
+        ttsModel == TTS_SUPERTONIC_SONIQO_FULL_FP16;
+    if (strict_full_fp16 && backend != 1 && backend != 2) {
+        throw_runtime(
+            env,
+            "Soniqo FULL FP16 W16A16 requires GPU or Qualcomm NPU/HTP backend");
+        return 0;
+    }
+    if (reza_hybrid && backend != 0) {
+        throw_runtime(
+            env,
+            "Reza2kn hybrid currently supports CPU/XNNPACK backend only");
         return 0;
     }
     if (backend < 0 || backend > 3) {
@@ -267,10 +336,19 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
     const std::string voice = to_string(env, voiceId);
     const std::string native_lib_dir = to_string(env, nativeLibraryDir);
     const std::string accel_cache_dir = to_string(env, acceleratorCacheDir);
+#if defined(__ANDROID__)
+    if (!native_lib_dir.empty()) {
+        ::setenv("ADSP_LIBRARY_PATH", native_lib_dir.c_str(), 1);
+    }
+#endif
+    speech_core::LiteRTEngine::get().configure_android_accelerators(
+        native_lib_dir, accel_cache_dir);
     std::shared_ptr<speech_core::SupertonicExternalRunner> external_runner;
-    if (backend == 1 || backend == 2) {
+    if (!strict_full_fp16 &&
+        (backend == 1 || backend == 2 || reza_hybrid)) {
         try {
-            external_runner = std::make_shared<JniSupertonicRunner>(env, acceleratorRunner);
+            external_runner = std::make_shared<JniSupertonicRunner>(
+                env, acceleratorRunner, /*owns_java_runner=*/false);
         } catch (const std::exception& e) {
             throw_runtime(env, std::string("Supertonic accelerator runner init failed: ") + e.what());
             return 0;
@@ -286,11 +364,24 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
         if (backend == 1) native_backend = speech_core::LiteRTSupertonicTts::Backend::Gpu;
         else if (backend == 2) native_backend = speech_core::LiteRTSupertonicTts::Backend::Npu;
         else if (backend == 3) native_backend = speech_core::LiteRTSupertonicTts::Backend::CpuFp16;
+        const std::string duration_model = reza_hybrid
+            ? dir + "/int4/duration_predictor.tflite"
+            : dir + "/duration_predictor.tflite";
+        const std::string encoder_model = reza_hybrid
+            ? dir + "/int4/text_encoder.tflite"
+            : dir + "/text_encoder.tflite";
+        const std::string vector_model = reza_hybrid
+            ? dir + "/vector_estimator_int8.onnx"
+            : dir + "/vector_estimator.tflite";
+        const std::string vocoder_model = reza_hybrid
+            ? dir + "/int8/vocoder.tflite"
+            : dir + "/vocoder.tflite";
+
         handle->tts = std::make_unique<speech_core::LiteRTSupertonicTts>(
-            dir + "/duration_predictor.tflite",
-            dir + "/text_encoder.tflite",
-            dir + "/vector_estimator.tflite",
-            dir + "/vocoder.tflite",
+            duration_model,
+            encoder_model,
+            vector_model,
+            vocoder_model,
             dir,
             dir + "/voice_styles",
             false,
@@ -298,7 +389,9 @@ Java_audio_soniqo_speech_NativeBridge_nativeCreateSynthesizer(
             native_backend,
             native_lib_dir,
             accel_cache_dir,
-            std::move(external_runner));
+            std::move(external_runner),
+            reza_hybrid,
+            strict_full_fp16);
         handle->supertonic = dynamic_cast<speech_core::LiteRTSupertonicTts*>(handle->tts.get());
         if (handle->supertonic) {
             if (!voice.empty()) handle->supertonic->set_voice(voice);

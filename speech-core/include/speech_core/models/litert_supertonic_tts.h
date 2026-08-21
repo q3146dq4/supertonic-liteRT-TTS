@@ -24,6 +24,9 @@ public:
     virtual bool supports_vector() const = 0;
     virtual bool supports_vocoder() const = 0;
     virtual std::string backend_report() const = 0;
+    virtual std::shared_ptr<SupertonicExternalRunner> clone_for_pregeneration() {
+        return {};
+    }
     virtual void run_duration(const int64_t* text_ids, size_t text_ids_count,
                               const float* style_dp, size_t style_dp_count,
                               const float* text_mask, size_t text_mask_count,
@@ -59,7 +62,9 @@ public:
                         Backend backend = Backend::Cpu,
                         std::string native_library_dir = {},
                         std::string accelerator_cache_dir = {},
-                        std::shared_ptr<SupertonicExternalRunner> external_runner = {});
+                        std::shared_ptr<SupertonicExternalRunner> external_runner = {},
+                        bool reza_hybrid = false,
+                        bool strict_full_fp16 = false);
     ~LiteRTSupertonicTts() override;
 
     void synthesize(const std::string& text,
@@ -159,6 +164,9 @@ private:
     std::vector<float> synth_chunk(const std::string& chunk,
                                    const std::string& language,
                                    size_t chunk_index);
+    std::vector<float> synth_chunk_reza(const std::string& chunk,
+                                        const std::string& language,
+                                        size_t chunk_index);
     const VoiceStyle& current_voice() const;
     void destroy_graphs() noexcept;
 
@@ -184,6 +192,8 @@ private:
     std::string native_library_dir_;
     std::string accelerator_cache_dir_;
     std::shared_ptr<SupertonicExternalRunner> external_runner_;
+    bool reza_hybrid_ = false;
+    bool strict_full_fp16_ = false;
     int chunk_cap_ = 64;
     float speed_ = 1.0f;
     uint32_t seed_ = 0;
@@ -212,6 +222,12 @@ private:
     std::vector<float> text_emb_scratch_;
     std::vector<float> latent_mask_scratch_;
     std::vector<float> latent_scratch_;
+
+    // Reza-only reusable fixed/dynamic staging buffers.
+    std::vector<float> reza_text_emb_real_scratch_;
+    std::vector<float> reza_text_mask_real_scratch_;
+    std::vector<float> reza_vocoder_latent_scratch_;
+    std::vector<float> reza_wav_scratch_;
 
     std::vector<float> last_pcm_;
 };

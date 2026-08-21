@@ -330,6 +330,8 @@ struct Graph {
     std::vector<std::string> output_names;
     std::vector<std::unique_ptr<LiteRtHostBuffer>> input_buffers;
     std::vector<std::unique_ptr<LiteRtHostBuffer>> output_buffers;
+    std::vector<uint16_t> fp16_input_scratch;
+    std::vector<uint16_t> fp16_output_scratch;
     bool fully_accelerated = false;
     std::string acceleration_detail;
 
@@ -342,6 +344,8 @@ struct Graph {
     void release_resources() noexcept {
         input_buffers.clear();
         output_buffers.clear();
+        fp16_input_scratch.clear();
+        fp16_output_scratch.clear();
         input_types.clear();
         output_types.clear();
         input_names.clear();
@@ -359,6 +363,75 @@ struct Graph {
     }
 
     bool uses_interpreter_primary() const { return is_cpu_backend(backend); }
+
+    static uint16_t float_to_half(float value) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t sign = (bits >> 16) & 0x8000u;
+        const uint32_t mantissa = bits & 0x007fffffu;
+        const uint32_t raw_exp = (bits >> 23) & 0xffu;
+        const int32_t exp = static_cast<int32_t>(raw_exp) - 127 + 15;
+        if (raw_exp == 0xffu) {
+            return static_cast<uint16_t>(
+                sign | (mantissa == 0 ? 0x7c00u : 0x7e00u));
+        }
+        if (exp <= 0) {
+            if (exp < -10) return static_cast<uint16_t>(sign);
+            uint32_t m = mantissa | 0x00800000u;
+            const uint32_t shift = static_cast<uint32_t>(14 - exp);
+            uint32_t hm = m >> shift;
+            const uint32_t rb = (m >> (shift - 1)) & 1u;
+            const uint32_t sticky = m & ((1u << (shift - 1)) - 1u);
+            if (rb && (sticky || (hm & 1u))) ++hm;
+            return static_cast<uint16_t>(sign | hm);
+        }
+        if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+        uint32_t hm = mantissa >> 13;
+        const uint32_t round = mantissa & 0x1fffu;
+        if (round > 0x1000u || (round == 0x1000u && (hm & 1u))) {
+            ++hm;
+            if (hm == 0x400u) {
+                hm = 0;
+                if (exp + 1 >= 31) {
+                    return static_cast<uint16_t>(sign | 0x7c00u);
+                }
+                return static_cast<uint16_t>(
+                    sign | (static_cast<uint32_t>(exp + 1) << 10));
+            }
+        }
+        return static_cast<uint16_t>(
+            sign | (static_cast<uint32_t>(exp) << 10) | hm);
+    }
+
+    static float half_to_float(uint16_t h) {
+        const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+        uint32_t exp = (h >> 10) & 0x1fu;
+        uint32_t mantissa = h & 0x03ffu;
+        uint32_t bits = 0;
+        if (exp == 0) {
+            if (mantissa == 0) {
+                bits = sign;
+            } else {
+                int shift = 0;
+                while ((mantissa & 0x0400u) == 0) {
+                    mantissa <<= 1;
+                    ++shift;
+                }
+                mantissa &= 0x03ffu;
+                const uint32_t exp32 =
+                    static_cast<uint32_t>(127 - 14 - shift);
+                bits = sign | (exp32 << 23) | (mantissa << 13);
+            }
+        } else if (exp == 31) {
+            bits = sign | 0x7f800000u | (mantissa << 13);
+        } else {
+            const uint32_t exp32 = exp + (127 - 15);
+            bits = sign | (exp32 << 23) | (mantissa << 13);
+        }
+        float out = 0.0f;
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
+    }
 
     static size_t elem_size(LiteRtElementType t) {
         switch (t) {
@@ -691,8 +764,24 @@ struct Graph {
             return;
         }
         const std::vector<int> expected_shape(cpu_shape);
-        const int index = find_accel_input_name(semantic_name ? semantic_name : "", expected_shape, cpu_occurrence);
-        const auto expected = layout_element_count(input_types[index].layout) * elem_size(input_types[index].element_type);
+        const int index = find_accel_input_name(
+            semantic_name ? semantic_name : "", expected_shape, cpu_occurrence);
+        const size_t elements = layout_element_count(input_types[index].layout);
+        const auto expected = elements * elem_size(input_types[index].element_type);
+        if (
+            input_types[index].element_type == kLiteRtElementTypeFloat16 &&
+            bytes == elements * sizeof(float)
+        ) {
+            const auto* src = static_cast<const float*>(data);
+            fp16_input_scratch.resize(elements);
+            for (size_t i = 0; i < elements; ++i) {
+                fp16_input_scratch[i] = float_to_half(src[i]);
+            }
+            input_buffers[index]->write(
+                fp16_input_scratch.data(),
+                fp16_input_scratch.size() * sizeof(uint16_t));
+            return;
+        }
         if (bytes != expected) {
             throw std::runtime_error("Supertonic[" + name + "]: input '" + semantic_name +
                                      "' byte-size mismatch: got=" + std::to_string(bytes) +
@@ -741,7 +830,31 @@ struct Graph {
             return;
         }
 
-        output_buffers[find_accel_output(shape, occurrence)]->read(data, bytes);
+        const int output_index = find_accel_output(shape, occurrence);
+        const size_t output_elements =
+            layout_element_count(output_types[output_index].layout);
+        if (
+            output_types[output_index].element_type == kLiteRtElementTypeFloat16 &&
+            bytes == output_elements * sizeof(float)
+        ) {
+            fp16_output_scratch.resize(output_elements);
+            output_buffers[output_index]->read(
+                fp16_output_scratch.data(),
+                fp16_output_scratch.size() * sizeof(uint16_t));
+            auto* dst = static_cast<float*>(data);
+            for (size_t i = 0; i < output_elements; ++i) {
+                dst[i] = half_to_float(fp16_output_scratch[i]);
+            }
+        } else {
+            const size_t expected = output_elements *
+                elem_size(output_types[output_index].element_type);
+            if (bytes != expected) {
+                throw std::runtime_error(
+                    "Supertonic[" + name + "]: output byte-size mismatch: got=" +
+                    std::to_string(bytes) + " expected=" + std::to_string(expected));
+            }
+            output_buffers[output_index]->read(data, bytes);
+        }
 
         // Full accelerator means no silent CPU rescue. If the hardware path
         // produces invalid floats, stop synthesis before those values can turn
@@ -842,12 +955,16 @@ LiteRTSupertonicTts::LiteRTSupertonicTts(
     Backend backend,
     std::string native_library_dir,
     std::string accelerator_cache_dir,
-    std::shared_ptr<SupertonicExternalRunner> external_runner)
+    std::shared_ptr<SupertonicExternalRunner> external_runner,
+    bool reza_hybrid,
+    bool strict_full_fp16)
     : num_threads_(std::max(1, std::min(64, num_threads))),
       backend_(backend),
       native_library_dir_(std::move(native_library_dir)),
       accelerator_cache_dir_(std::move(accelerator_cache_dir)),
       external_runner_(std::move(external_runner)),
+      reza_hybrid_(reza_hybrid),
+      strict_full_fp16_(strict_full_fp16),
       duration_path_(duration_path),
       text_encoder_path_(text_encoder_path),
       vector_estimator_path_(vector_estimator_path),
@@ -856,7 +973,43 @@ LiteRTSupertonicTts::LiteRTSupertonicTts(
       voice_styles_dir_(voice_styles_dir) {
     (void)hw_accel;
 
-    if (is_cpu_backend(backend_)) {
+    if (strict_full_fp16_) {
+        if (backend_ != Backend::Gpu && backend_ != Backend::Npu) {
+            throw std::runtime_error(
+                "Supertonic FULL FP16 requires strict GPU or NPU backend");
+        }
+        if (external_runner_) {
+            throw std::runtime_error(
+                "Supertonic FULL FP16 must use native strict LiteRT path");
+        }
+        interp_ = std::make_unique<InterpreterState>();
+        interp_->duration.load(duration_path_, num_threads_, backend_, "duration");
+        interp_->encoder.load(text_encoder_path_, num_threads_, backend_, "encoder");
+        interp_->vector.load(
+            vector_estimator_path_, num_threads_, backend_, "vector_estimator");
+        interp_->vocoder.load(vocoder_path_, num_threads_, backend_, "vocoder");
+        backend_report_ = backend_ == Backend::Npu
+            ? "Soniqo FULL FP16 W16A16 / Qualcomm NPU STRICT FULL"
+            : "Soniqo FULL FP16 W16A16 / LiteRT GPU STRICT FULL";
+        pre_generation_ = false;
+    } else if (reza_hybrid_) {
+        if (backend_ != Backend::Cpu) {
+            throw std::runtime_error(
+                "Supertonic Reza hybrid currently supports CPU/XNNPACK only");
+        }
+        if (!external_runner_ || !external_runner_->supports_vector()) {
+            throw std::runtime_error(
+                "Supertonic Reza hybrid requires the ONNX vector estimator runner");
+        }
+
+        // Reuse the already-validated native LiteRT/XNNPACK path for all three
+        // converted LiteRT components. Only vector_estimator crosses to ORT.
+        interp_ = std::make_unique<InterpreterState>();
+        interp_->duration.load(duration_path_, num_threads_, Backend::Cpu, "duration");
+        interp_->encoder.load(text_encoder_path_, num_threads_, Backend::Cpu, "encoder");
+        interp_->vocoder.load(vocoder_path_, num_threads_, Backend::Cpu, "vocoder");
+        backend_report_ = external_runner_->backend_report();
+    } else if (is_cpu_backend(backend_)) {
         // Preserve the verified FP32 baseline and keep FP16 as a separate
         // XNNPACK-only experiment using the same published FP32 model files.
         interp_ = std::make_unique<InterpreterState>();
@@ -892,7 +1045,8 @@ LiteRTSupertonicTts::LiteRTSupertonicTts(
     namespace fs = std::filesystem;
     tokenizer_ = std::make_unique<SupertonicTokenizer>(
         (fs::path(tokenizer_dir_) / "unicode_indexer.json").string(),
-        (fs::path(tokenizer_dir_) / "tts.json").string());
+        (fs::path(tokenizer_dir_) / "tts.json").string(),
+        reza_hybrid_ ? 320 : kTextT);
 
     for (const auto& entry : fs::directory_iterator(voice_styles_dir_)) {
         if (entry.path().extension() != ".json") continue;
@@ -1044,10 +1198,23 @@ void LiteRTSupertonicTts::synthesize(const std::string& text,
             pregen_engines_.clear();
             pregen_engines_.reserve(static_cast<size_t>(effective_pregen_depth));
             for (int i = 0; i < effective_pregen_depth; ++i) {
+                std::shared_ptr<SupertonicExternalRunner> child_runner;
+                if (reza_hybrid_) {
+                    if (!external_runner_) {
+                        throw std::runtime_error(
+                            "Supertonic Reza pre-generation runner is missing");
+                    }
+                    child_runner = external_runner_->clone_for_pregeneration();
+                    if (!child_runner) {
+                        throw std::runtime_error(
+                            "Supertonic Reza pre-generation runner clone failed");
+                    }
+                }
                 pregen_engines_.push_back(std::make_unique<LiteRTSupertonicTts>(
                     duration_path_, text_encoder_path_, vector_estimator_path_, vocoder_path_,
                     tokenizer_dir_, voice_styles_dir_, false, num_threads_, backend_,
-                    native_library_dir_, accelerator_cache_dir_, std::shared_ptr<SupertonicExternalRunner>{}));
+                    native_library_dir_, accelerator_cache_dir_, std::move(child_runner),
+                    reza_hybrid_));
             }
         }
         for (auto& engine : pregen_engines_) {
@@ -1375,6 +1542,7 @@ std::string LiteRTSupertonicTts::performance_profile() const {
 std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
                                                      const std::string& language,
                                                      size_t chunk_index) {
+    if (reza_hybrid_) return synth_chunk_reza(chunk, language, chunk_index);
     if (is_cpu_backend(backend_) && !interp_)
         throw std::runtime_error("Supertonic: CPU interpreter state is not initialized");
     if (!is_cpu_backend(backend_) && !external_runner_)
@@ -1534,5 +1702,197 @@ std::vector<float> LiteRTSupertonicTts::synth_chunk(const std::string& chunk,
     wav.resize(n);
     return wav;
 }
+
+std::vector<float> LiteRTSupertonicTts::synth_chunk_reza(
+    const std::string& chunk,
+    const std::string& language,
+    size_t chunk_index) {
+    if (!interp_ || !external_runner_ || !external_runner_->supports_vector()) {
+        throw std::runtime_error(
+            "Supertonic Reza hybrid runtime is not initialized");
+    }
+
+    constexpr int kRezaTextT = 320;
+    constexpr int kRezaLatentL = 320;
+
+    const VoiceStyle& voice = current_voice();
+
+    const auto token_start = SteadyClock::now();
+    const auto tok = tokenizer_->process(chunk, language, kRezaTextT);
+    profile_.token_process_ms += elapsed_ms(token_start, SteadyClock::now());
+
+    size_t t_real = 0;
+    while (t_real < tok.mask.size() && tok.mask[t_real] > 0.5f) ++t_real;
+    t_real = std::max<size_t>(1, t_real);
+
+    ids64_scratch_.assign(tok.ids.begin(), tok.ids.end());
+    const auto& ids64 = ids64_scratch_;
+
+    float duration = 0.0f;
+    {
+        const auto t0 = SteadyClock::now();
+        interp_->duration.write_input_named(
+            "text_mask", {1, 1, kRezaTextT},
+            tok.mask.data(), tok.mask.size() * sizeof(float));
+        interp_->duration.write_input_named(
+            "text_ids", {1, kRezaTextT},
+            ids64.data(), ids64.size() * sizeof(int64_t));
+        interp_->duration.write_input_named(
+            "style_dp", {1, 8, 16},
+            voice.style_dp.data(), voice.style_dp.size() * sizeof(float));
+        interp_->duration.run("Reza duration Run");
+        interp_->duration.read_output({1}, &duration, sizeof(float));
+        profile_.duration_predictor_ms += elapsed_ms(t0, SteadyClock::now());
+    }
+
+    if (!(duration > 0.0f) || !std::isfinite(duration)) {
+        throw std::runtime_error(
+            "Supertonic Reza: duration predictor returned invalid/non-finite output");
+    }
+
+    const double max_graph_duration_s =
+        static_cast<double>(kRezaLatentL) * kChunkSamples / kSampleRateConst;
+    if (duration > max_graph_duration_s * 1.001) ++profile_.truncated_chunks;
+
+    text_emb_scratch_.resize(
+        static_cast<size_t>(256) * static_cast<size_t>(kRezaTextT));
+    {
+        const auto t0 = SteadyClock::now();
+        interp_->encoder.write_input_named(
+            "text_mask", {1, 1, kRezaTextT},
+            tok.mask.data(), tok.mask.size() * sizeof(float));
+        interp_->encoder.write_input_named(
+            "text_ids", {1, kRezaTextT},
+            ids64.data(), ids64.size() * sizeof(int64_t));
+        interp_->encoder.write_input_named(
+            "style_ttl", {1, 50, 256},
+            voice.style_ttl.data(), voice.style_ttl.size() * sizeof(float));
+        interp_->encoder.run("Reza text_encoder Run");
+        interp_->encoder.read_output(
+            {1, 256, kRezaTextT},
+            text_emb_scratch_.data(),
+            text_emb_scratch_.size() * sizeof(float));
+
+        if (!Graph::all_finite(
+                text_emb_scratch_.data(), text_emb_scratch_.size())) {
+            throw std::runtime_error(
+                "Supertonic Reza: text encoder returned non-finite output");
+        }
+        profile_.text_encoder_ms += elapsed_ms(t0, SteadyClock::now());
+    }
+
+    // Reza's ONNX VE consumes native T_real, not the padded T=320 embedding.
+    const auto copy_start = SteadyClock::now();
+    reza_text_emb_real_scratch_.resize(static_cast<size_t>(256) * t_real);
+    for (int c = 0; c < 256; ++c) {
+        std::copy_n(
+            text_emb_scratch_.data() + static_cast<size_t>(c) * kRezaTextT,
+            t_real,
+            reza_text_emb_real_scratch_.data() + static_cast<size_t>(c) * t_real);
+    }
+    reza_text_mask_real_scratch_.assign(
+        tok.mask.begin(),
+        tok.mask.begin() + static_cast<std::ptrdiff_t>(t_real));
+    profile_.tensor_copy_ms += elapsed_ms(copy_start, SteadyClock::now());
+
+    const long long wav_len =
+        static_cast<long long>(duration * static_cast<float>(kSampleRateConst));
+    const int l_real = std::max(
+        1,
+        std::min(
+            kRezaLatentL,
+            static_cast<int>((wav_len + kChunkSamples - 1) / kChunkSamples)));
+
+    const auto latent_start = SteadyClock::now();
+    latent_mask_scratch_.assign(static_cast<size_t>(l_real), 1.0f);
+
+    std::mt19937 rng(
+        seed_used_ + 0x9E3779B9u * static_cast<uint32_t>(chunk_index + 1));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    latent_scratch_.resize(static_cast<size_t>(kLatentChannels) * l_real);
+    for (float& x : latent_scratch_) x = nd(rng);
+    profile_.latent_setup_ms += elapsed_ms(latent_start, SteadyClock::now());
+
+    const float total_step_f = static_cast<float>(total_step_);
+    if (profile_.ve_step_ms.size() != static_cast<size_t>(total_step_)) {
+        profile_.ve_step_ms.assign(static_cast<size_t>(total_step_), 0.0);
+    }
+
+    for (int step = 0; step < total_step_; ++step) {
+        if (cancelled_.load()) return {};
+
+        const auto t0 = SteadyClock::now();
+        const float current_step_f = static_cast<float>(step);
+
+        external_runner_->run_vector(
+            latent_scratch_.data(), latent_scratch_.size(),
+            reza_text_emb_real_scratch_.data(),
+            reza_text_emb_real_scratch_.size(),
+            voice.style_ttl.data(), voice.style_ttl.size(),
+            latent_mask_scratch_.data(), latent_mask_scratch_.size(),
+            reza_text_mask_real_scratch_.data(),
+            reza_text_mask_real_scratch_.size(),
+            current_step_f, total_step_f);
+
+        if (!Graph::all_finite(
+                latent_scratch_.data(), latent_scratch_.size())) {
+            throw std::runtime_error(
+                "Supertonic Reza: vector estimator returned non-finite output at step " +
+                std::to_string(step + 1));
+        }
+
+        profile_.ve_step_ms[static_cast<size_t>(step)] +=
+            elapsed_ms(t0, SteadyClock::now());
+    }
+
+    // Upstream Reza vocoder is fixed L=320. Pad only at this boundary.
+    const auto vocoder_pad_start = SteadyClock::now();
+    reza_vocoder_latent_scratch_.assign(
+        static_cast<size_t>(kLatentChannels) * kRezaLatentL, 0.0f);
+
+    for (int c = 0; c < kLatentChannels; ++c) {
+        std::copy_n(
+            latent_scratch_.data() + static_cast<size_t>(c) * l_real,
+            static_cast<size_t>(l_real),
+            reza_vocoder_latent_scratch_.data() +
+                static_cast<size_t>(c) * kRezaLatentL);
+    }
+    profile_.tensor_copy_ms +=
+        elapsed_ms(vocoder_pad_start, SteadyClock::now());
+
+    reza_wav_scratch_.resize(
+        static_cast<size_t>(kChunkSamples) * kRezaLatentL);
+
+    {
+        const auto t0 = SteadyClock::now();
+        interp_->vocoder.write_input_named(
+            "latent", {1, kLatentChannels, kRezaLatentL},
+            reza_vocoder_latent_scratch_.data(),
+            reza_vocoder_latent_scratch_.size() * sizeof(float));
+        interp_->vocoder.run("Reza vocoder Run");
+        interp_->vocoder.read_output(
+            {1, kChunkSamples * kRezaLatentL},
+            reza_wav_scratch_.data(),
+            reza_wav_scratch_.size() * sizeof(float));
+
+        if (!Graph::all_finite(
+                reza_wav_scratch_.data(), reza_wav_scratch_.size())) {
+            throw std::runtime_error(
+                "Supertonic Reza: vocoder returned non-finite output");
+        }
+        profile_.vocoder_ms += elapsed_ms(t0, SteadyClock::now());
+    }
+
+    // Match upstream inference.py: crop fixed-L320 vocoder output back to L_real.
+    size_t n = static_cast<size_t>(l_real) *
+               static_cast<size_t>(kChunkSamples);
+    n = std::min(n, reza_wav_scratch_.size());
+
+    return std::vector<float>(
+        reza_wav_scratch_.begin(),
+        reza_wav_scratch_.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
 
 } // namespace speech_core

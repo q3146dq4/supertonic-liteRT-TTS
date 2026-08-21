@@ -19,3 +19,11 @@
 
 # Qualcomm QNN delegate creates native-backed classes/reflection entry points.
 -keep class com.qualcomm.qti.** { *; }
+
+# JNI runner ABI: native code looks up these exact class/method names
+-keep class audio.soniqo.speech.SupertonicRunnerBridge { *; }
+-keep class audio.soniqo.speech.DelegateSupertonicRunner { *; }
+-keep class audio.soniqo.speech.RezaSupertonicRunner { *; }
+
+# Reza vector_estimator via ONNX Runtime Android
+-keep class ai.onnxruntime.** { *; }

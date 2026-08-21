@@ -2,7 +2,11 @@ package audio.soniqo.speech
 
 import android.util.Log
 
-enum class TtsModel(internal val nativeId: Int) { SUPERTONIC(1) }
+enum class TtsModel(internal val nativeId: Int) {
+    SUPERTONIC(1),
+    SUPERTONIC_REZA(2),
+    SUPERTONIC_SONIQO_FULL_FP16(3),
+}
 
 enum class InferenceBackend(internal val nativeId: Int) {
     CPU_XNNPACK(0),
@@ -80,7 +84,7 @@ internal class SpeechSynthesizerImpl(
      * and the native low-energy audio guard all converge here and trigger one
      * clean CPU recreation before any audio is returned to the caller.
      */
-    @Volatile private var acceleratorRunner: DelegateSupertonicRunner? = null
+    @Volatile private var acceleratorRunner: SupertonicRunnerBridge? = null
     @Volatile private var handle: Long = 0L
     @Volatile private var activeBackend = InferenceBackend.CPU_XNNPACK
     @Volatile private var fallbackReason: String? = null
@@ -99,7 +103,10 @@ internal class SpeechSynthesizerImpl(
         try {
             installBackend(config.backend)
         } catch (t: Throwable) {
-            if (config.backend == InferenceBackend.CPU_XNNPACK) throw t
+            if (
+                config.ttsModel == TtsModel.SUPERTONIC_SONIQO_FULL_FP16 ||
+                config.backend == InferenceBackend.CPU_XNNPACK
+            ) throw t
             fallbackReason = "${config.backend.name} init failed: ${messageOf(t)}"
             Log.w(TAG, "Accelerator init failed; using CPU/XNNPACK", t)
             installBackend(InferenceBackend.CPU_XNNPACK)
@@ -107,10 +114,25 @@ internal class SpeechSynthesizerImpl(
     }
 
     private fun installBackend(backend: InferenceBackend) {
-        var madeRunner: DelegateSupertonicRunner? = null
+        var madeRunner: SupertonicRunnerBridge? = null
         var madeHandle = 0L
         try {
-            if (!backend.isNativeCpu) {
+            if (config.ttsModel == TtsModel.SUPERTONIC_SONIQO_FULL_FP16) {
+                check(
+                    backend == InferenceBackend.GPU_LITERT ||
+                    backend == InferenceBackend.QUALCOMM_NPU
+                ) {
+                    "Soniqo FULL FP16 W16A16 requires GPU or Qualcomm NPU/HTP strict backend"
+                }
+                // Native strict LiteRT CompiledModel path: no Java delegate runner.
+            } else if (config.ttsModel == TtsModel.SUPERTONIC_REZA) {
+                check(backend == InferenceBackend.CPU_XNNPACK) {
+                    "Reza2kn hybrid currently supports CPU/XNNPACK only"
+                }
+                madeRunner = RezaSupertonicRunner(
+                    config.copy(backend = InferenceBackend.CPU_XNNPACK)
+                )
+            } else if (!backend.isNativeCpu) {
                 madeRunner = DelegateSupertonicRunner(config.copy(backend = backend))
             }
             madeHandle = NativeBridge.nativeCreateSynthesizer(
@@ -152,7 +174,10 @@ internal class SpeechSynthesizerImpl(
 
     private fun fallbackToCpu(failure: Throwable) {
         val failedBackend = activeBackend
-        if (failedBackend == InferenceBackend.CPU_XNNPACK) throw failure
+        if (
+            config.ttsModel == TtsModel.SUPERTONIC_SONIQO_FULL_FP16 ||
+            failedBackend == InferenceBackend.CPU_XNNPACK
+        ) throw failure
         fallbackReason = "${failedBackend.name} rejected: ${messageOf(failure)}"
         Log.w(TAG, "Accelerator output rejected; recreating on CPU/XNNPACK", failure)
 
@@ -172,7 +197,8 @@ internal class SpeechSynthesizerImpl(
         val native = if (handle != 0L) NativeBridge.nativeGetLastProfile(handle) else ""
         return buildString {
             if (native.isNotBlank()) append(native).append(';')
-            append("requested_backend=").append(config.backend.name)
+            append("model=").append(config.ttsModel.name)
+            append(";requested_backend=").append(config.backend.name)
             append(";active_backend=").append(activeBackend.name)
             append(";accelerator_fallback=").append(fallbackReason ?: "none")
         }

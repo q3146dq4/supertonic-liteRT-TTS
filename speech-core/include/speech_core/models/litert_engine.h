@@ -244,6 +244,7 @@ public:
         LOGI("Loading LiteRT model: %s",
              path.substr(path.find_last_of('/') + 1).c_str());
 
+        LiteRtEnvironment environment = env();
         LiteRtModel m = nullptr;
         // LiteRT v2.1.5's LiteRtCreateModelFromFile fails on Windows for files
         // ≥ 2 GiB ("Failed to get file size" — 32-bit stat overflow). VoxCPM2's
@@ -258,7 +259,15 @@ public:
         // caps it at one copy per path. Threshold is well under 2 GiB so the
         // INT8 prefill graph (~2.0 GiB) also routes through the safer path on
         // Windows.
+#if defined(__ANDROID__)
+        // LiteRT 2.1.6's file-backed model loader can return
+        // kLiteRtStatusErrorFileIO on an otherwise readable app-private model
+        // path. Android CompiledModel graphs are small enough here to use the
+        // buffer API instead. The retained buffer outlives LiteRtModel.
+        constexpr std::uint64_t kBufferThreshold = 0;
+#else
         constexpr std::uint64_t kBufferThreshold = std::uint64_t{1} << 30;  // 1 GiB
+#endif
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f) {
             throw std::runtime_error("LiteRT: cannot open " + path);
@@ -279,11 +288,11 @@ public:
                 buf_ptr = buf.get();
                 retained_buffers_.emplace(path, std::move(buf));
             }
-            litert_check(LiteRtCreateModelFromBuffer(buf_ptr->data(), buf_ptr->size(), &m),
+            litert_check(LiteRtCreateModelFromBuffer(environment, buf_ptr->data(), buf_ptr->size(), &m),
                          "CreateModelFromBuffer");
         } else {
             f.close();
-            litert_check(LiteRtCreateModelFromFile(path.c_str(), &m), "CreateModelFromFile");
+            litert_check(LiteRtCreateModelFromFile(environment, path.c_str(), &m), "CreateModelFromFile");
         }
 
         // Build compile options for the requested accelerator. LiteRT rejects
@@ -305,7 +314,7 @@ public:
         }
 
         LiteRtCompiledModel c = nullptr;
-        s = LiteRtCreateCompiledModel(env(), m, opts, &c);
+        s = LiteRtCreateCompiledModel(environment, m, opts, &c);
         LiteRtDestroyOptions(opts);
         if (s != kLiteRtStatusOk) {
             LiteRtDestroyModel(m);

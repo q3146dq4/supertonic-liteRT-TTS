@@ -11,6 +11,7 @@ object TtsSettings {
     private const val KEY_TEST_LANGUAGE = "test_language"
     private const val KEY_THREADS = "threads"
     private const val KEY_BACKEND = "backend"
+    private const val KEY_TTS_MODEL = "tts_model"
     private const val KEY_CPU_DEFAULT_MIGRATION = "cpu_default_backend_migration_20260818_delegate_v3"
     private const val KEY_CHUNK_MODE = "chunk_mode"
     private const val KEY_CHUNK_CAP = "chunk_cap"
@@ -61,6 +62,13 @@ object TtsSettings {
         }.getOrDefault(InferenceBackend.CPU_XNNPACK)
         return restored
     }
+    fun ttsModel(context: Context): TtsModel = runCatching {
+        TtsModel.valueOf(
+            prefs(context).getString(KEY_TTS_MODEL, TtsModel.SUPERTONIC.name)
+                ?: TtsModel.SUPERTONIC.name
+        )
+    }.getOrDefault(TtsModel.SUPERTONIC)
+
     fun chunkMode(context: Context): String = prefs(context).getString(KEY_CHUNK_MODE, CHUNK_BALANCED) ?: CHUNK_BALANCED
     fun manualChunkCap(context: Context): Int = prefs(context).getInt(KEY_CHUNK_CAP, 64).coerceIn(MIN_CHUNK_CAP, MAX_CHUNK_CAP)
     fun preGeneration(context: Context): Boolean = prefs(context).getBoolean(KEY_PREGEN, false)
@@ -101,6 +109,16 @@ object TtsSettings {
             .commit()) { "Failed to persist Supertonic TTS settings" }
     }
 
+
+    fun setTtsModel(context: Context, model: TtsModel) {
+        check(
+            prefs(context).edit()
+                .putString(KEY_TTS_MODEL, model.name)
+                .commit()
+        ) {
+            "Failed to persist Supertonic model setting"
+        }
+    }
 
     fun setBackend(context: Context, backend: InferenceBackend) {
         check(prefs(context).edit()
